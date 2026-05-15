@@ -20,16 +20,23 @@ const roleNames = {
 const navItems = [
   ["dashboard", "首页工作台"],
   ["customers", "客户管理"],
-  ["orders", "测评订单"],
+  ["orders", "订单汇总"],
   ["import", "订单导入"],
   ["finance", "财务管理"],
-  ["pricing", "价格公式"],
+  ["pricing", "业务报价"],
   ["logs", "操作日志"],
 ];
 
 const vpPlatforms = ["亚马逊", "沃尔玛", "TK", "SHEIN", "TEMU"];
 const vpSites = ["美国", "加拿大", "英国", "德国", "意大利", "法国", "西班牙", "日本", "澳大利亚", "中东"];
 const vpProjects = ["免评", "点星", "feedback", "文评", "图评", "视频"];
+const orderTypes = [
+  { key: "direct", label: "直评", prefix: "CP" },
+  { key: "vp", label: "VP真人", legacy: "VP", prefix: "VP" },
+  { key: "vine", label: "VINE定制", legacy: "VINE", prefix: "VN" },
+  { key: "show", label: "买家秀", prefix: "BX" },
+];
+const orderTypeLabels = orderTypes.map((x) => x.label);
 
 const directSiteMap = {
   美国: "US",
@@ -64,8 +71,49 @@ function today(offset = 0) {
   return d.toISOString().slice(0, 10);
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function money(n) {
   return Number(n || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function isFinanciallyComplete(order) {
+  return order.paymentStatus === "已收款" && order.payoutStatus === "已付款";
+}
+
+function completedUnits(order) {
+  const items = order.batchOrders || [order];
+  return items.filter((item) => isFinanciallyComplete(item));
+}
+
+function calculablePerformance(order) {
+  return completedUnits(order).reduce((sum, item) => sum + Number(item.received || 0) - Number(item.paid || 0), 0);
+}
+
+function performanceText(order) {
+  return completedUnits(order).length ? `¥${money(calculablePerformance(order))}` : "";
+}
+
+function orderStatusText(order) {
+  if (order.voided) return "已作废";
+  if (order.batchOrders?.length && completedUnits(order).length && completedUnits(order).length < order.batchOrders.length) return "部分完成";
+  return isFinanciallyComplete(order) ? order.status || "已完成" : "未完成";
+}
+
+function submittedAtOf(order) {
+  return order.submittedAt || `${order.acceptedAt || today()}T00:00:00.000Z`;
+}
+
+function submittedAtText(order) {
+  return new Date(submittedAtOf(order)).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function loadState() {
@@ -184,6 +232,16 @@ function loadState() {
       },
     ],
     logs: [],
+    orderSummary: {
+      query: "",
+      expandedType: "",
+      filters: {},
+      showVoided: false,
+      expandedBatchIds: {},
+    },
+    dispatchBuilder: null,
+    dispatchDraft: null,
+    pendingVoidOrderId: "",
     pricing: {
       direct: [
         { site: "US", warranty7: 40, warranty30: 80 },
@@ -204,6 +262,14 @@ function loadState() {
 }
 
 let state = loadState();
+state.orderSummary ||= { query: "", expandedType: "", filters: {} };
+state.orderSummary.filters ||= {};
+state.orderSummary.showVoided ||= false;
+state.orderSummary.expandedBatchIds ||= {};
+state.dispatchBuilder ||= null;
+state.dispatchDraft ||= null;
+state.pendingVoidOrderId ||= "";
+state = normalizeState(state);
 
 function saveState(next = state) {
   memoryState = next;
@@ -324,6 +390,8 @@ function render() {
         </header>
         <div class="content">${renderPage()}</div>
       </main>
+      ${renderVoidConfirmModal()}
+      ${renderDispatchBuilderModal()}
     </div>
   `;
   bindShell();
@@ -385,6 +453,101 @@ function renderPage() {
   return (pages[state.activePage] || renderDashboard)();
 }
 
+function normalizeState(next) {
+  next.orderSummary ||= { query: "", expandedType: "", filters: {} };
+  next.orderSummary.filters ||= {};
+  next.orderSummary.showVoided ||= false;
+  next.orderSummary.expandedBatchIds ||= {};
+  next.dispatchBuilder ||= null;
+  next.dispatchDraft = normalizeDispatchDraft(next.dispatchDraft);
+  next.pendingVoidOrderId ||= "";
+  return next;
+}
+
+function normalizeDispatchDraft(draft) {
+  if (!draft) return null;
+  if (Array.isArray(draft.rows)) return draft;
+  const projects = Array.isArray(draft.projects) && draft.projects.length ? draft.projects : parseLegacyProjectText(draft.projectText);
+  const safeProjects = projects.length ? projects : [{ count: 1, project: "免评" }];
+  return {
+    orderId: draft.orderId,
+    orderNo: draft.orderNo || "",
+    rows: safeProjects.flatMap((item) =>
+      Array.from({ length: Math.max(1, Number(item.count || 1)) }, () => ({
+        productName: draft.productName || "",
+        keyword: draft.keyword || "",
+        asin: draft.asin || "",
+        variant: draft.variant || "无",
+        price: draft.price || "",
+        store: draft.store || "",
+        project: item.project || "免评",
+        requirement: draft.requirement || "无",
+      })),
+    ),
+  };
+}
+
+function parseLegacyProjectText(text) {
+  return String(text || "")
+    .split(/[，,]/)
+    .map((part) => part.trim().match(/^(\d+)\s*单\s*(.+)$/))
+    .filter(Boolean)
+    .map((match) => ({ count: Math.max(1, Number(match[1])), project: match[2].trim() }));
+}
+
+function renderVoidConfirmModal() {
+  if (!state.pendingVoidOrderId) return "";
+  const order = state.orders.find((o) => o.id === state.pendingVoidOrderId);
+  if (!order) return "";
+  return `
+    <div class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true">
+        <h2>确认作废订单</h2>
+        <p>订单 ${order.orderNo} 作废后不会删除历史记录，但前端不能自行恢复；如需恢复，必须由后端订单处理人员操作。</p>
+        <div class="modal-actions">
+          <button class="btn ghost" id="cancelVoidOrder">取消</button>
+          <button class="btn danger" id="confirmVoidOrder">确认作废</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderDispatchBuilderModal() {
+  const builder = state.dispatchBuilder;
+  if (!builder) return "";
+  return `
+    <div class="modal-backdrop">
+      <div class="modal dispatch-builder-modal" role="dialog" aria-modal="true">
+        <h2>设置排单项目</h2>
+        <div class="dispatch-builder-list">
+          ${builder.lines
+            .map(
+              (line, index) => `
+                <div class="dispatch-builder-row">
+                  <input type="number" min="1" data-builder-count="${index}" value="${escapeAttr(line.count || 1)}" />
+                  <select data-builder-project="${index}">
+                    ${vpProjects.map((project) => `<option ${line.project === project ? "selected" : ""}>${project}</option>`).join("")}
+                  </select>
+                  ${
+                    index === builder.lines.length - 1
+                      ? `<button class="icon-btn" data-add-builder-line title="新增项目">+</button>`
+                      : `<button class="icon-btn" data-remove-builder-line="${index}" title="删除项目">-</button>`
+                  }
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="cancelDispatchBuilder">取消</button>
+          <button class="btn primary" id="confirmDispatchBuilder">确认</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function bindShell() {
   document.querySelectorAll("[data-nav]").forEach((btn) => {
     btn.addEventListener("click", () => setPage(btn.dataset.nav));
@@ -396,9 +559,68 @@ function bindShell() {
   });
   document.querySelector("#resetDemo").addEventListener("click", () => {
     safeStorageRemove();
-    state = loadState();
+    state = normalizeState(loadState());
     toast("演示数据已重置");
     render();
+  });
+  document.querySelector("#cancelVoidOrder")?.addEventListener("click", () => {
+    state.pendingVoidOrderId = "";
+    saveState();
+    render();
+  });
+  document.querySelector("#confirmVoidOrder")?.addEventListener("click", () => {
+    const o = state.orders.find((x) => x.id === state.pendingVoidOrderId);
+    if (!o) return;
+    o.voided = true;
+    o.voidedAt = new Date().toISOString();
+    o.voidedBy = currentUser().id;
+    state.pendingVoidOrderId = "";
+    log("订单作废", `${o.orderNo}，恢复需后端处理`);
+    saveState();
+    toast("订单已作废，恢复需后端处理");
+    render();
+  });
+  document.querySelector("#cancelDispatchBuilder")?.addEventListener("click", () => {
+    state.dispatchBuilder = null;
+    saveState();
+    render();
+  });
+  document.querySelectorAll("[data-builder-count]").forEach((input) => {
+    input.addEventListener("input", (event) => {
+      const index = Number(event.currentTarget.dataset.builderCount);
+      state.dispatchBuilder.lines[index].count = Math.max(1, Number(event.currentTarget.value || 1));
+      saveState();
+    });
+  });
+  document.querySelectorAll("[data-builder-project]").forEach((select) => {
+    select.addEventListener("change", (event) => {
+      const index = Number(event.currentTarget.dataset.builderProject);
+      state.dispatchBuilder.lines[index].project = event.currentTarget.value;
+      saveState();
+    });
+  });
+  document.querySelector("[data-add-builder-line]")?.addEventListener("click", () => {
+    state.dispatchBuilder.lines.push({ count: 1, project: "免评" });
+    saveState();
+    render();
+  });
+  document.querySelectorAll("[data-remove-builder-line]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.dispatchBuilder.lines.splice(Number(btn.dataset.removeBuilderLine), 1);
+      saveState();
+      render();
+    });
+  });
+  document.querySelector("#confirmDispatchBuilder")?.addEventListener("click", async () => {
+    const builder = state.dispatchBuilder;
+    const order = state.orders.find((o) => o.id === builder?.orderId);
+    if (!builder || !order) return;
+    state.dispatchDraft = appendDispatchRows(state.dispatchDraft, order, builder.lines);
+    state.dispatchBuilder = null;
+    saveState();
+    render();
+    copyText(dispatchSheetCopyText(state.dispatchDraft));
+    toast("排单表已生成并复制");
   });
 
   const binders = {
@@ -415,9 +637,9 @@ function bindShell() {
 
 function performanceOn(date) {
   return state.orders
-    .filter((o) => !o.voided && o.performanceAt === date)
+    .filter((o) => !o.voided && isFinanciallyComplete(o) && o.performanceAt === date)
     .reduce((map, o) => {
-      map[o.frontendId] = (map[o.frontendId] || 0) + Number(o.performance || 0);
+      map[o.frontendId] = (map[o.frontendId] || 0) + calculablePerformance(o);
       return map;
     }, {});
 }
@@ -434,7 +656,7 @@ function renderDashboard() {
   const orders = visibleOrders().filter((o) => !o.voided);
   const todayRank = rankingFor(today());
   const champs = [today(-1), today(-2), today(-3)].map((d) => ({ date: d, item: rankingFor(d)[0] }));
-  const totalPerformance = orders.reduce((sum, o) => sum + Number(o.performance || 0), 0);
+  const totalPerformance = orders.reduce((sum, o) => sum + calculablePerformance(o), 0);
   const pendingCollection = orders.filter((o) => o.paymentStatus !== "已收款").length;
   return `
     <section class="section">
@@ -512,7 +734,7 @@ function renderCustomers() {
       <div class="section-head"><h2>客户列表</h2><span class="hint">${user.role === "admin" ? "管理员可见联系方式" : "联系方式已隐藏"}</span></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>客户编号</th><th>客户</th><th>联系方式</th><th>店铺</th><th>状态</th><th>累计成交</th><th>备注</th><th>操作</th></tr></thead>
+          <thead><tr><th>客户编号</th><th>客户</th><th>联系方式</th><th>店铺</th><th>状态</th><th>累计成交</th><th>备注</th></tr></thead>
           <tbody>
             ${rows
               .map((c) => `
@@ -524,7 +746,6 @@ function renderCustomers() {
                   <td><span class="tag ${c.status === "已作废" ? "red" : "green"}">${c.status}</span></td>
                   <td>¥${money(c.totalDealAmount)}</td>
                   <td>${c.remark || ""}</td>
-                  <td><button class="btn warn" data-void-customer="${c.id}">标记作废</button></td>
                 </tr>
               `)
               .join("")}
@@ -556,49 +777,234 @@ function bindCustomers() {
     toast("客户已提交，前端后续不可见核心联系方式");
     render();
   });
-  document.querySelectorAll("[data-void-customer]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const c = state.customers.find((x) => x.id === btn.dataset.voidCustomer);
-      c.status = "已作废";
-      c.voidedAt = new Date().toISOString();
-      c.voidedBy = currentUser().id;
-      log("客户作废", c.name);
-      saveState();
-      render();
+}
+
+function renderOrders() {
+  state.orderSummary ||= { query: "", expandedType: "", filters: {} };
+  const orders = visibleOrders().filter((o) => Boolean(o.voided) === Boolean(state.orderSummary.showVoided));
+  const user = currentUser();
+  const query = state.orderSummary.query || "";
+  const expandedType = state.orderSummary.expandedType || "";
+  const summaryOrders = filterOrdersByQuery(orders, query);
+  const activeType = expandedType && orderTypes.find((t) => t.label === expandedType || t.legacy === expandedType);
+  return `
+    ${user.role === "leader" ? renderLeaderOrderSummary(summaryOrders) : ""}
+    <section class="section">
+      <div class="section-head"><h2>订单查询</h2><span class="hint">${user.role === "frontend" ? "仅展示个人订单" : user.role === "leader" ? "展示本组订单" : "按角色权限展示可见订单"}</span></div>
+      <div class="toolbar">
+        <input id="orderSearch" value="${escapeAttr(query)}" placeholder="搜索订单号、客户、产品、ASIN、项目" />
+        <button class="btn primary" id="runOrderSearch">查询</button>
+        <button class="btn ghost" id="clearOrderSearch">清空</button>
+        ${activeType ? `<button class="btn ghost" id="backOrderSummary">返回四类汇总</button>` : ""}
+        <button class="btn ghost toolbar-right" id="toggleVoidedOrders">${state.orderSummary.showVoided ? "返回全部订单" : "作废订单列表"}</button>
+      </div>
+    </section>
+    ${renderDispatchDraft()}
+    ${
+      activeType
+        ? renderExpandedOrderType(activeType, summaryOrders)
+        : orderTypes.map((type) => renderOrderTypePreview(type, summaryOrders)).join("")
+    }
+  `;
+}
+
+function renderDispatchDraft() {
+  const draft = state.dispatchDraft;
+  if (!draft) return "";
+  const projects = summarizeDraftProjects(draft.rows);
+  return `
+    <section class="section dispatch-section">
+      <div class="section-head">
+        <h2>${projects.map((item) => `${item.count}单${item.project}`).join("，")} 排单表</h2>
+        <div class="toolbar compact">
+          <span class="hint">已根据 ${draft.orderNo} 自动填充，可修改后提交</span>
+          <button class="btn ghost" id="cancelDispatchDraft">关闭</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dispatch-table">
+          <thead><tr><th>产品名</th><th>关键词</th><th>ASIN</th><th>变体</th><th>价格</th><th>店铺</th><th>项目</th><th>备注要求</th></tr></thead>
+          <tbody>
+            ${draft.rows
+              .map(
+                (row, index) => `
+                  <tr>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="productName" value="${escapeAttr(row.productName || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="keyword" value="${escapeAttr(row.keyword || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="asin" value="${escapeAttr(row.asin || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="variant" value="${escapeAttr(row.variant || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="price" value="${escapeAttr(row.price || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="store" value="${escapeAttr(row.store || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="project" value="${escapeAttr(row.project || "")}" /></td>
+                    <td><input data-dispatch-row="${index}" data-dispatch-field="requirement" value="${escapeAttr(row.requirement || "")}" /></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="dispatch-actions">
+        <button class="btn primary" id="submitDispatchDraft">提交排单</button>
+      </div>
+    </section>
+  `;
+}
+
+function orderTypeLabel(type) {
+  const found = orderTypes.find((item) => item.label === type || item.legacy === type);
+  return found?.label || type || "直评";
+}
+
+function directProjectLabel(project) {
+  if (/^[1-5]星$/.test(project || "")) return project;
+  return "5星";
+}
+
+function projectLinesOf(order) {
+  if (order.projectLines?.length) return consolidateProjectLines(order.projectLines);
+  if (orderTypeLabel(order.type) === "直评") {
+    return [{ count: Number(order.quantity || 1), project: directProjectLabel(order.project) }];
+  }
+  return [{ count: Number(order.quantity || 1), project: order.project || orderTypeLabel(order.type) }];
+}
+
+function consolidateProjectLines(lines) {
+  const map = new Map();
+  lines.forEach((line) => {
+    const project = line.project || "项目";
+    map.set(project, (map.get(project) || 0) + Math.max(1, Number(line.count || 1)));
+  });
+  return [...map.entries()].map(([project, count]) => ({ count, project }));
+}
+
+function projectSummaryText(order) {
+  return projectLinesOf(order)
+    .map((line) => `${line.count}单${line.project}`)
+    .join("，");
+}
+
+function projectSummaryHtml(order) {
+  return projectLinesOf(order)
+    .map((line) => `${line.count}单<br><span class="hint">${line.project}</span>`)
+    .join("<br>");
+}
+
+function ordersForType(orders, type) {
+  return mergeBatchOrders(
+    orders
+    .filter((o) => orderTypeLabel(o.type) === type.label)
+    .sort((a, b) => submittedAtOf(b).localeCompare(submittedAtOf(a))),
+  );
+}
+
+function mergeBatchOrders(orders) {
+  const merged = new Map();
+  orders.forEach((order) => {
+    const key = order.batchId
+      ? [order.batchId, orderTypeLabel(order.type), order.customerId, order.asin, order.productName].join("|")
+      : order.id;
+    if (!merged.has(key)) {
+      merged.set(key, { ...order, projectLines: [...projectLinesOf(order)], batchOrders: [order] });
+      return;
+    }
+    const item = merged.get(key);
+    item.batchOrders.push(order);
+    item.projectLines.push(...projectLinesOf(order));
+    item.receivable = Number(item.receivable || 0) + Number(order.receivable || 0);
+    item.received = Number(item.received || 0) + Number(order.received || 0);
+    item.payable = Number(item.payable || 0) + Number(order.payable || 0);
+    item.paid = Number(item.paid || 0) + Number(order.paid || 0);
+    item.paymentStatus = item.batchOrders.every((child) => child.paymentStatus === "已收款") ? "已收款" : "未收款";
+    item.payoutStatus = item.batchOrders.every((child) => child.payoutStatus === "已付款") ? "已付款" : "未付款";
+  });
+  return [...merged.values()];
+}
+
+function filterOrdersByQuery(orders, query) {
+  const keyword = String(query || "").trim().toLowerCase();
+  if (!keyword) return orders;
+  return orders.filter((o) => {
+    const c = state.customers.find((x) => x.id === o.customerId);
+    return [o.orderNo, o.type, c?.name, o.productName, o.asin, projectSummaryText(o), orderStatusText(o)]
+      .join(" ")
+      .toLowerCase()
+      .includes(keyword);
+  });
+}
+
+function filterOrdersByColumn(orders, typeLabel) {
+  const filters = state.orderSummary.filters?.[typeLabel] || {};
+  return orders.filter((o) => {
+    const c = state.customers.find((x) => x.id === o.customerId);
+    const checks = {
+      orderNo: o.orderNo,
+      customer: c?.name || "",
+      project: projectSummaryText(o),
+      status: orderStatusText(o),
+    };
+    return Object.entries(filters).every(([key, value]) => {
+      const needle = String(value || "").trim().toLowerCase();
+      return !needle || String(checks[key] || "").toLowerCase().includes(needle);
     });
   });
 }
 
-function renderOrders() {
-  const orders = visibleOrders();
+function renderOrderTypePreview(type, orders) {
+  const rows = ordersForType(orders, type);
+  if (!rows.length) {
+    return `
+      <section class="section collapsed-section">
+        <div class="section-head"><h2>${type.label}</h2><span class="hint">暂无订单</span></div>
+      </section>
+    `;
+  }
   return `
     <section class="section">
-      <div class="section-head"><h2>新增测评订单</h2><span class="hint">所有订单必须选择客户，录入时间即接单时间</span></div>
-      <form id="orderForm" class="form-grid">
-        <div class="field"><label>业务类型</label><select name="type" id="orderType"><option>直评</option><option>VP</option><option>VINE</option><option>买家秀</option></select></div>
-        <div class="field"><label>客户</label><select name="customerId" required>${visibleCustomers().map((c) => `<option value="${c.id}">${c.name}</option>`).join("")}</select></div>
-        <div class="field"><label>站点</label><input name="site" value="US" /></div>
-        <div class="field"><label>项目</label><select name="project">${["直评", ...vpProjects].map((p) => `<option>${p}</option>`).join("")}</select></div>
-        <div class="field"><label>产品名</label><input name="productName" /></div>
-        <div class="field"><label>关键词</label><input name="keyword" /></div>
-        <div class="field"><label>ASIN</label><input name="asin" required /></div>
-        <div class="field"><label>变体</label><input name="variant" /></div>
-        <div class="field"><label>价格</label><input name="price" type="number" step="0.01" /></div>
-        <div class="field"><label>店铺</label><input name="store" /></div>
-        <div class="field"><label>应收款</label><input name="receivable" type="number" step="0.01" value="0" /></div>
-        <div class="field"><label>应付款</label><input name="payable" type="number" step="0.01" value="0" /></div>
-        <div class="field"><label>渠道名称</label><input name="channelName" required /></div>
-        <div class="field span-2"><label>备注要求</label><input name="requirement" /></div>
-        <button class="btn primary span-4" type="submit">提交订单</button>
-      </form>
+      <div class="section-head">
+        <h2>${type.label}</h2>
+        <div class="toolbar compact">
+          <span class="hint">最新 ${Math.min(rows.length, 3)} / ${rows.length} 单</span>
+          <button class="btn ghost" data-view-type="${type.label}">查看更多</button>
+        </div>
+      </div>
+      ${renderOrdersTable(rows.slice(0, 3), { compact: true, type })}
     </section>
+  `;
+}
+
+function renderExpandedOrderType(type, orders) {
+  const rows = filterOrdersByColumn(ordersForType(orders, type), type.label);
+  return `
     <section class="section">
-      <div class="section-head"><h2>订单列表</h2><span class="hint">订单不物理删除，只能标记作废</span></div>
-      <div class="table-wrap">
+      <div class="section-head"><h2>${type.label}全部订单</h2><span class="hint">可通过表头筛选当前项目订单</span></div>
+      ${renderOrdersTable(rows, { filterType: type.label, type })}
+    </section>
+  `;
+}
+
+function renderLeaderOrderSummary(orders) {
+  const teamUsers = users.filter((u) => u.team === currentUser().team && ["frontend", "leader"].includes(u.role));
+  const totalPerformance = orders.reduce((sum, o) => sum + calculablePerformance(o), 0);
+  const activeCount = orders.filter((o) => !o.voided).length;
+  return `
+    <section class="section">
+      <div class="section-head"><h2>小组订单情况</h2><span class="hint">组长可查看本组人员订单与整体情况</span></div>
+      <div class="grid cols-3">
+        <div class="metric"><span>本组可见订单</span><strong>${orders.length}</strong></div>
+        <div class="metric"><span>未作废订单</span><strong>${activeCount}</strong></div>
+        <div class="metric"><span>本组累计业绩</span><strong>¥${money(totalPerformance)}</strong></div>
+      </div>
+      <div class="table-wrap mt-12">
         <table>
-          <thead><tr><th>订单号</th><th>类型</th><th>客户</th><th>产品/ASIN</th><th>项目</th><th>渠道</th><th>收付款</th><th>业绩</th><th>状态</th><th>操作</th></tr></thead>
+          <thead><tr><th>人员</th><th>订单数</th><th>未作废</th><th>待处理</th><th>累计业绩</th></tr></thead>
           <tbody>
-            ${orders.map(renderOrderRow).join("")}
+            ${teamUsers
+              .map((u) => {
+                const owned = orders.filter((o) => o.frontendId === u.id);
+                return `<tr><td>${u.name}</td><td>${owned.length}</td><td>${owned.filter((o) => !o.voided).length}</td><td>${owned.filter((o) => !o.voided && !isFinanciallyComplete(o)).length}</td><td>¥${money(owned.reduce((sum, o) => sum + calculablePerformance(o), 0))}</td></tr>`;
+              })
+              .join("")}
           </tbody>
         </table>
       </div>
@@ -606,78 +1012,257 @@ function renderOrders() {
   `;
 }
 
+function renderOrdersTable(orders, options = {}) {
+  const filterType = options.filterType || "";
+  const typeLabel = options.type?.label || orderTypeLabel(orders[0]?.type);
+  const filters = filterType ? state.orderSummary.filters?.[filterType] || {} : {};
+  const isDirect = typeLabel === "直评";
+  return `
+    <div class="table-wrap">
+      <table class="${options.compact ? "compact-table" : ""}">
+        <thead>
+          ${
+            isDirect
+              ? `<tr><th>提交时间</th><th>订单号</th><th>客户</th><th>站点</th><th>ASIN</th><th>数量/项目</th><th>收付款</th><th>业绩</th><th>状态</th><th>操作</th></tr>`
+              : `<tr><th>提交时间</th><th>订单号</th><th>客户</th><th>平台/站点</th><th>产品/ASIN</th><th>数量/项目</th><th>收付款</th><th>业绩</th><th>状态</th><th>操作</th></tr>`
+          }
+          ${
+            filterType
+              ? `<tr class="filter-row">
+                  <th></th>
+                  <th><input data-order-filter="${filterType}:orderNo" value="${escapeAttr(filters.orderNo || "")}" placeholder="筛订单号" /></th>
+                  <th><input data-order-filter="${filterType}:customer" value="${escapeAttr(filters.customer || "")}" placeholder="筛客户" /></th>
+                  <th></th>
+                  <th></th>
+                  <th><input data-order-filter="${filterType}:project" value="${escapeAttr(filters.project || "")}" placeholder="筛项目" /></th>
+                  <th></th><th></th>
+                  <th><input data-order-filter="${filterType}:status" value="${escapeAttr(filters.status || "")}" placeholder="筛状态" /></th>
+                  <th><button class="btn ghost" data-clear-type-filter="${filterType}">清空筛选</button></th>
+                </tr>`
+              : ""
+          }
+        </thead>
+        <tbody>${orders.length ? orders.map(renderOrderRows).join("") : `<tr><td colspan="10" class="empty">没有符合条件的订单</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function batchKeyOf(order) {
+  return order.batchId || order.id;
+}
+
+function renderOrderRows(o) {
+  const expanded = Boolean(state.orderSummary.expandedBatchIds?.[batchKeyOf(o)]);
+  return `${renderOrderRow(o)}${expanded ? renderBatchDetailRows(o) : ""}`;
+}
+
 function renderOrderRow(o) {
   const c = state.customers.find((x) => x.id === o.customerId);
-  const canSeeChannel = o.type === "直评" || ["admin", "finance", "backend"].includes(currentUser().role);
+  const user = currentUser();
+  const isDirect = orderTypeLabel(o.type) === "直评";
+  const siteCell = isDirect ? `${o.site || "-"}` : `${o.platform || "-"}<br><span class="hint">${o.site || ""}</span>`;
+  const productCell = isDirect ? `${o.asin || "-"}` : `${o.productName || "-"}<br><span class="hint">${o.asin || ""}</span>`;
   return `
     <tr class="${o.voided ? "invalid-row" : ""}">
+      <td>${submittedAtText(o)}</td>
       <td>${o.orderNo}</td>
-      <td><span class="tag">${o.type}</span></td>
       <td>${c?.name || "未知客户"}</td>
-      <td>${o.productName || "-"}<br><span class="hint">${o.asin || ""}</span></td>
-      <td>${o.project || "-"}</td>
-      <td>${canSeeChannel ? o.channelName || "-" : "不可见"}</td>
-      <td>收 ¥${money(o.received || 0)} / 付 ¥${money(o.paid || 0)}</td>
-      <td>¥${money(o.performance || 0)}</td>
-      <td><span class="tag ${o.voided ? "red" : "green"}">${o.voided ? "已作废" : o.status}</span></td>
+      <td>${siteCell}</td>
+      <td>${productCell}</td>
+      <td>${projectSummaryHtml(o)}</td>
+      <td>收 ¥${money(o.received || 0)}<br><span class="hint">付 ¥${money(o.paid || 0)}</span></td>
+      <td>${performanceText(o)}</td>
+      <td><span class="tag ${o.voided ? "red" : isFinanciallyComplete(o) ? "green" : "amber"}">${orderStatusText(o)}</span></td>
       <td>
-        ${o.type === "VP" ? `<button class="btn ghost" data-copy-vp="${o.id}">复制排单</button>` : ""}
-        <button class="btn warn" data-void-order="${o.id}">作废</button>
+        ${o.batchOrders?.length > 1 ? `<button class="btn ghost" data-toggle-batch="${batchKeyOf(o)}">${state.orderSummary.expandedBatchIds?.[batchKeyOf(o)] ? "收起" : "展开"}</button>` : ""}
+        ${orderTypeLabel(o.type) === "VP真人" ? `<button class="btn ghost" data-copy-vp="${o.id}">复制排单</button>` : ""}
+        ${o.voided && user.role === "backend" ? `<button class="btn ghost" data-restore-order="${o.id}">恢复订单</button>` : ""}
+        ${!o.voided ? `<button class="btn warn" data-void-order="${o.id}">作废</button>` : ""}
       </td>
     </tr>
   `;
 }
 
+function renderBatchDetailRows(order) {
+  return (order.batchOrders || [])
+    .map((child, index) => {
+      const isDirect = orderTypeLabel(child.type) === "直评";
+      const c = state.customers.find((x) => x.id === child.customerId);
+      const siteCell = isDirect ? `${child.site || "-"}` : `${child.platform || "-"}<br><span class="hint">${child.site || ""}</span>`;
+      const productCell = isDirect ? `${child.asin || "-"}` : `${child.productName || "-"}<br><span class="hint">${child.asin || ""}</span>`;
+      return `
+        <tr class="batch-detail-row ${child.voided ? "invalid-row" : ""}">
+          <td>${submittedAtText(child)}</td>
+          <td>${child.orderNo}<br><span class="hint">第 ${index + 1} 单</span></td>
+          <td>${c?.name || "未知客户"}</td>
+          <td>${siteCell}</td>
+          <td>${productCell}</td>
+          <td>${projectSummaryHtml(child)}</td>
+          <td>收 ¥${money(child.received || 0)}<br><span class="hint">付 ¥${money(child.paid || 0)}</span></td>
+          <td>${performanceText(child)}</td>
+          <td><span class="tag ${child.voided ? "red" : isFinanciallyComplete(child) ? "green" : "amber"}">${orderStatusText(child)}</span></td>
+          <td></td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
 function bindOrders() {
-  document.querySelector("#orderForm").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-    const user = currentUser();
-    const order = createOrderFromData(data, user.id);
-    state.orders.unshift(order);
-    log("新增订单", `${order.orderNo} / ${order.type}`);
+  document.querySelector("#runOrderSearch").addEventListener("click", () => {
+    state.orderSummary.query = document.querySelector("#orderSearch").value;
     saveState();
-    toast("订单已提交");
     render();
   });
-  document.querySelectorAll("[data-void-order]").forEach((btn) => {
+  document.querySelector("#orderSearch").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    state.orderSummary.query = event.currentTarget.value;
+    saveState();
+    render();
+  });
+  document.querySelector("#clearOrderSearch").addEventListener("click", () => {
+    state.orderSummary.query = "";
+    state.orderSummary.filters = {};
+    saveState();
+    render();
+  });
+  document.querySelector("#toggleVoidedOrders").addEventListener("click", () => {
+    state.orderSummary.showVoided = !state.orderSummary.showVoided;
+    state.orderSummary.expandedBatchIds = {};
+    saveState();
+    render();
+  });
+  document.querySelector("#backOrderSummary")?.addEventListener("click", () => {
+    state.orderSummary.expandedType = "";
+    state.orderSummary.filters = {};
+    saveState();
+    render();
+  });
+  document.querySelectorAll("[data-view-type]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const o = state.orders.find((x) => x.id === btn.dataset.voidOrder);
-      o.voided = true;
-      o.voidedAt = new Date().toISOString();
-      o.voidedBy = currentUser().id;
-      log("订单作废", o.orderNo);
+      state.orderSummary.expandedType = btn.dataset.viewType;
+      state.orderSummary.filters ||= {};
+      state.orderSummary.filters[btn.dataset.viewType] ||= {};
       saveState();
       render();
     });
   });
-  document.querySelectorAll("[data-copy-vp]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const o = state.orders.find((x) => x.id === btn.dataset.copyVp);
-      await copyText(vpCopyText([o]));
-      toast("VP 排单信息已复制");
+  document.querySelectorAll("[data-toggle-batch]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.toggleBatch;
+      state.orderSummary.expandedBatchIds[key] = !state.orderSummary.expandedBatchIds[key];
+      saveState();
+      render();
     });
+  });
+  document.querySelectorAll("[data-order-filter]").forEach((input) => {
+    input.addEventListener("change", updateOrderFilter);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") updateOrderFilter(event);
+    });
+  });
+  document.querySelectorAll("[data-clear-type-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.orderSummary.filters[btn.dataset.clearTypeFilter] = {};
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-void-order]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.pendingVoidOrderId = btn.dataset.voidOrder;
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-restore-order]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const o = state.orders.find((x) => x.id === btn.dataset.restoreOrder);
+      if (!o || currentUser().role !== "backend") return;
+      o.voided = false;
+      o.restoredAt = new Date().toISOString();
+      o.restoredBy = currentUser().id;
+      log("恢复订单", o.orderNo);
+      saveState();
+      toast("订单已恢复");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-copy-vp]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const o = state.orders.find((x) => x.id === btn.dataset.copyVp);
+      state.dispatchBuilder = dispatchBuilderFromOrder(o);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-dispatch-field]").forEach((input) => {
+    input.addEventListener("input", (event) => {
+      const field = event.currentTarget.dataset.dispatchField;
+      const rowIndex = Number(event.currentTarget.dataset.dispatchRow);
+      state.dispatchDraft.rows[rowIndex][field] = event.currentTarget.value;
+      saveState();
+    });
+  });
+  document.querySelector("#cancelDispatchDraft")?.addEventListener("click", () => {
+    state.dispatchDraft = null;
+    saveState();
+    render();
+  });
+  document.querySelector("#submitDispatchDraft")?.addEventListener("click", async () => {
+    const draft = state.dispatchDraft;
+    if (!draft) return;
+    const source = state.orders.find((o) => o.id === draft.orderId);
+    if (!source) return;
+    const orders = createDispatchBatchOrders(source, draft);
+    orders.slice().reverse().forEach((order) => state.orders.unshift(order));
+    log("提交排单", `${orders[0].orderNo} / ${projectTextFromRows(draft.rows) || "VP真人"}`);
+    state.dispatchDraft = null;
+    saveState();
+    render();
+    copyText(dispatchSheetCopyText(draft));
+    toast("排单表已提交，订单已加入汇总");
   });
 }
 
-function createOrderFromData(data, userId) {
+function updateOrderFilter(event) {
+  const [typeLabel, field] = event.currentTarget.dataset.orderFilter.split(":");
+  state.orderSummary.filters ||= {};
+  state.orderSummary.filters[typeLabel] ||= {};
+  state.orderSummary.filters[typeLabel][field] = event.currentTarget.value;
+  saveState();
+  render();
+}
+
+function nextOrderNo(typeMeta, offset = 0) {
+  const d = new Date();
+  const mmdd = `${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  const sameDay = state.orders.filter((o) => String(o.orderNo || "").startsWith(`${typeMeta.prefix}${mmdd}`)).length + 1 + offset;
+  return `${typeMeta.prefix}${mmdd}${String(sameDay).padStart(3, "0")}`;
+}
+
+function createOrderFromData(data, userId, meta = {}) {
   const type = data.type || "直评";
-  const numberPrefix = type === "VP" ? "VP" : "CP";
+  const typeMeta = orderTypes.find((item) => item.label === type || item.legacy === type) || orderTypes[0];
+  const normalizedType = typeMeta.label;
   const receivable = Number(data.receivable || 0);
   const payable = Number(data.payable || 0);
   const received = 0;
   const paid = 0;
   return {
     id: uid("o"),
-    orderNo: `${numberPrefix}${today().replaceAll("-", "")}${String(state.orders.length + 1).padStart(4, "0")}`,
-    type,
+    orderNo: nextOrderNo(typeMeta),
+    type: normalizedType,
+    batchId: meta.batchId || "",
     customerId: data.customerId,
     frontendId: userId,
     backendId: "u-back",
     acceptedAt: today(),
+    submittedAt: nowIso(),
     completedAt: "",
     performanceAt: "",
-    platform: type === "直评" ? "亚马逊" : data.platform || "亚马逊",
+    platform: normalizedType === "直评" ? "亚马逊" : data.platform || "亚马逊",
     site: normalizeSite(data.site || "US"),
     productName: data.productName || "",
     productImage: data.productImage || "",
@@ -686,7 +1271,13 @@ function createOrderFromData(data, userId) {
     variant: data.variant || "",
     price: Number(data.price || 0),
     store: data.store || "",
-    project: data.project || type,
+    project: normalizedType === "直评" ? directProjectLabel(data.project) : data.project || normalizedType,
+    projectLines: [
+      {
+        count: Math.max(1, Number(data.quantity || 1)),
+        project: normalizedType === "直评" ? directProjectLabel(data.project) : data.project || normalizedType,
+      },
+    ],
     requirement: data.requirementRemark || data.requirement || "",
     requirementRemark: data.requirementRemark || "",
     remark: data.remark || "",
@@ -698,8 +1289,8 @@ function createOrderFromData(data, userId) {
     status: "待处理",
     paymentStatus: "未收款",
     payoutStatus: "未付款",
-    channelName: data.channelName || "",
-    channelVisible: type === "直评",
+    channelName: currentUser()?.role === "backend" ? data.channelName || "" : "",
+    channelVisible: normalizedType === "直评",
     voided: false,
   };
 }
@@ -734,12 +1325,89 @@ function extractAsin(value) {
   return asin ? asin[0].toUpperCase() : text;
 }
 
-function vpCopyText(orders) {
-  const grouped = orders.reduce((list, o) => {
-    list.push(`${o.project || "项目"} 1单`);
-    return list;
-  }, []);
-  const first = orders[0];
+function dispatchBuilderFromOrder(order) {
+  const defaultProject = vpProjects.includes(order.project) ? order.project : "免评";
+  return {
+    orderId: order.id,
+    lines: [{ count: 1, project: defaultProject }],
+  };
+}
+
+function dispatchRowsFromOrder(order, lines) {
+  return lines.flatMap((line) => {
+    const count = Math.max(1, Number(line.count || 1));
+    const project = vpProjects.includes(line.project) ? line.project : "免评";
+    return Array.from({ length: count }, () => ({
+      productName: order.productName || "",
+      keyword: order.keyword || "",
+      asin: order.asin || "",
+      variant: order.variant || "无",
+      price: order.price || "",
+      store: order.store || "",
+      project,
+      requirement: order.requirement || "无",
+    }));
+  });
+}
+
+function appendDispatchRows(existingDraft, order, lines) {
+  const rows = dispatchRowsFromOrder(order, lines);
+  if (existingDraft?.orderId === order.id) {
+    return { ...existingDraft, rows: [...existingDraft.rows, ...rows] };
+  }
+  return {
+    orderId: order.id,
+    orderNo: order.orderNo,
+    rows,
+  };
+}
+
+function summarizeDraftProjects(rows) {
+  return consolidateProjectLines(rows.map((row) => ({ count: 1, project: row.project })));
+}
+
+function projectTextFromRows(rows) {
+  return summarizeDraftProjects(rows)
+    .map((item) => `${item.count}单${item.project}`)
+    .join("，");
+}
+
+function createDispatchBatchOrders(source, draft) {
+  const typeMeta = orderTypes.find((item) => item.label === orderTypeLabel(source.type)) || orderTypes[1];
+  const batchId = uid("batch");
+  const submittedAt = nowIso();
+  return draft.rows.map((row, index) => ({
+    ...source,
+    id: uid("o"),
+    batchId,
+    orderNo: nextOrderNo(typeMeta, index),
+    type: typeMeta.label,
+    acceptedAt: today(),
+    submittedAt,
+    completedAt: "",
+    performanceAt: "",
+    productName: row.productName,
+    keyword: row.keyword,
+    asin: row.asin,
+    variant: row.variant,
+    price: Number(row.price || 0),
+    store: row.store,
+    project: row.project,
+    projectLines: [{ count: 1, project: row.project }],
+    requirement: row.requirement,
+    received: 0,
+    paid: 0,
+    performance: 0,
+    status: "待处理",
+    paymentStatus: "未收款",
+    payoutStatus: "未付款",
+    voided: false,
+    dispatchSheet: { ...draft, submittedAt, submittedBy: currentUser().id },
+  }));
+}
+
+function dispatchSheetCopyText(draft) {
+  const first = draft.rows[0] || {};
   return [
     `产品名：${first.productName || ""}`,
     `关键词：${first.keyword || ""}`,
@@ -747,15 +1415,19 @@ function vpCopyText(orders) {
     `变体：${first.variant || "无"}`,
     `价格：${first.price || ""}`,
     `店铺：${first.store || ""}`,
-    `项目要求：${grouped.join("，")}`,
+    `项目要求：${projectTextFromRows(draft.rows) || "1单项目"}`,
     `备注要求：${first.requirement || "无"}`,
   ].join("\n");
 }
 
 async function copyText(text) {
   if (navigator.clipboard) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (error) {
+      // file:// contexts often expose clipboard but still deny writes.
+    }
   }
   const area = document.createElement("textarea");
   area.value = text;
@@ -763,21 +1435,41 @@ async function copyText(text) {
   area.select();
   document.execCommand("copy");
   area.remove();
+  return true;
 }
 
 function renderImport() {
   return `
     <section class="section">
-      <div class="section-head"><h2>订单导入</h2><span class="hint">先预览，信息完整才允许提交</span></div>
+      <div class="section-head"><h2>手工录入订单</h2><span class="hint">订单按类型自动归入订单汇总</span></div>
+      <form id="manualOrderForm" class="form-grid">
+        <div class="field"><label>业务类型</label><select name="type">${orderTypeLabels.map((type) => `<option>${type}</option>`).join("")}</select></div>
+        <div class="field"><label>客户</label><select name="customerId" required>${visibleCustomers().map((c) => `<option value="${c.id}">${c.name}</option>`).join("")}</select></div>
+        <div class="field"><label>站点</label><select name="site">${vpSites.map((site) => `<option>${site}</option>`).join("")}</select></div>
+        <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" /></div>
+        <div class="field"><label>项目</label><select name="project">${["5星", "4星", "3星", "2星", "1星", ...vpProjects, "VINE定制", "买家秀"].map((p) => `<option>${p}</option>`).join("")}</select></div>
+        <div class="field"><label>产品名</label><input name="productName" /></div>
+        <div class="field"><label>关键词</label><input name="keyword" /></div>
+        <div class="field"><label>ASIN</label><input name="asin" required /></div>
+        <div class="field"><label>变体</label><input name="variant" /></div>
+        <div class="field"><label>价格</label><input name="price" type="number" step="0.01" /></div>
+        <div class="field"><label>店铺</label><input name="store" /></div>
+        <div class="field"><label>应收款</label><input name="receivable" type="number" step="0.01" value="0" /></div>
+        <div class="field"><label>应付款</label><input name="payable" type="number" step="0.01" value="0" /></div>
+        <div class="field span-2"><label>备注要求</label><input name="requirement" /></div>
+        <button class="btn primary span-4" type="submit">提交订单</button>
+      </form>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>表格内容识别</h2><span class="hint">直接复制表格单元格，系统按表头关键字识别</span></div>
       <div class="toolbar">
-        <select id="importType"><option>直评</option><option>VP</option></select>
         <button class="btn primary" id="parsePaste">识别内容</button>
         <button class="btn ghost" id="clearImport">清空</button>
       </div>
       <div class="field">
-        <label>从表格复制后粘贴到这里</label>
-        <textarea id="pasteArea" placeholder="VP 可以直接粘贴一行：US    主图空列    女士长裤    Leg Pants for Women    17.99    Sampeel    无/自选    B0FP5BYXVR    2单免评，使用优惠券    无"></textarea>
-        <div class="hint">VP 无表头时按固定顺序识别：站点、主图、产品名、关键词、价格、店铺、变体、ASIN、下单要求、特殊备注。</div>
+        <label>从员工表格中复制有效区域后粘贴到这里</label>
+        <textarea id="pasteArea" placeholder="VP 无表头时可直接复制：站点、产品名、关键词、价格、店铺名、变体、核对ASIN、下单要求、特殊备注。"></textarea>
+        <div class="hint">系统会自动判断直评或 VP。带表头时按关键字识别；VP 不带表头时，按固定 9 列顺序识别。主图在预览页逐行补传。</div>
       </div>
     </section>
     <section class="section">
@@ -798,17 +1490,15 @@ function renderImportPreview() {
             .map((row, index) => `
               <tr class="${row.errors.length ? "invalid-row" : ""}">
                 <td>${row.errors.length ? `<span class="tag red">不可提交</span>` : `<span class="tag green">可提交</span>`}</td>
-                <td>
-                  <select class="cell-select" data-preview-field="${index}:type">
-                    ${["直评", "VP"].map((type) => `<option value="${type}" ${row.type === type ? "selected" : ""}>${type}</option>`).join("")}
-                  </select>
-                </td>
+                <td><span class="tag">${orderTypeLabel(row.type)}</span></td>
                 <td>
                   <input class="cell-input" list="customerOptions" data-preview-field="${index}:customerName" value="${escapeAttr(row.customerName || "")}" placeholder="输入或选择客户" />
                 </td>
                 <td><input class="cell-input small" data-preview-field="${index}:site" value="${escapeAttr(row.site || "")}" /></td>
                 <td>
-                  ${row.productImage ? `<img class="thumb" src="${row.productImage}" alt="产品图" />` : `<span class="tag red">缺图</span>`}
+                  ${row.productImage
+                    ? `<img class="thumb" src="${row.productImage}" alt="产品图" />`
+                    : `<span class="tag ${orderTypeLabel(row.type) === "VP真人" ? "red" : ""}">${orderTypeLabel(row.type) === "VP真人" ? "缺图" : "可上传"}</span>`}
                   <input class="image-input" type="file" accept="image/*" data-preview-image="${index}" />
                 </td>
                 <td>
@@ -821,7 +1511,10 @@ function renderImportPreview() {
                   <input class="cell-input" data-preview-field="${index}:store" value="${escapeAttr(row.store || "")}" style="margin-top:6px" />
                 </td>
                 <td><input class="cell-input" data-preview-field="${index}:variant" value="${escapeAttr(row.variant || "")}" /></td>
-                <td><input class="cell-input small" data-preview-field="${index}:project" value="${escapeAttr(row.project || "")}" /></td>
+                <td>
+                  <input class="cell-input small" data-preview-field="${index}:project" value="${escapeAttr(row.project || "")}" />
+                  ${orderTypeLabel(row.type) === "直评" ? `<input class="cell-input small" data-preview-field="${index}:warranty" value="${escapeAttr(row.warranty || "")}" placeholder="质保天数" style="margin-top:6px" />` : ""}
+                </td>
                 <td>
                   <input class="cell-input" data-preview-field="${index}:requirementRemark" value="${escapeAttr(row.requirementRemark || "")}" placeholder="要求" />
                   <input class="cell-input" data-preview-field="${index}:remark" value="${escapeAttr(row.remark || "")}" placeholder="备注" style="margin-top:6px" />
@@ -840,9 +1533,19 @@ function renderImportPreview() {
 }
 
 function bindImport() {
+  document.querySelector("#manualOrderForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const order = createOrderFromData(data, currentUser().id);
+    state.orders.unshift(order);
+    log("手工录入订单", `${order.orderNo} / ${order.type}`);
+    saveState();
+    toast("订单已提交并归入订单汇总");
+    render();
+  });
   document.querySelector("#parsePaste").addEventListener("click", () => {
-    const type = document.querySelector("#importType").value;
     const text = document.querySelector("#pasteArea").value;
+    const type = detectImportType(text);
     state.importPreview = parsePastedRows(text, type);
     log("导入识别", `${type} / ${state.importPreview.length} 行`);
     saveState();
@@ -855,9 +1558,10 @@ function bindImport() {
   });
   document.querySelector("#submitPreview").addEventListener("click", () => {
     const valid = state.importPreview.filter((r) => !r.errors.length);
+    const batchId = uid("batch");
     valid.forEach((r) => {
       ensureImportCustomer(r);
-      state.orders.unshift(createOrderFromData(r, currentUser().id));
+      state.orders.unshift(createOrderFromData(r, currentUser().id, { batchId }));
     });
     log("批量提交订单", `${valid.length} 条`);
     state.importPreview = state.importPreview.filter((r) => r.errors.length);
@@ -896,20 +1600,12 @@ function updatePreviewField(event) {
     const customer = state.customers.find((c) => c.name === row.customerName.trim());
     row.customerId = customer?.id || "";
   }
-  if (field === "type" && row.type === "直评") {
-    row.platform = "亚马逊";
-    row.site = normalizeDirectSite(row.site);
-    row.project = row.project && row.project !== "免评" ? row.project : "直评";
-  }
-  if (field === "type" && row.type === "VP") {
-    row.platform = row.platform || "亚马逊";
-    row.site = normalizeSite(row.site);
-  }
   if (field === "site") {
-    row.site = row.type === "直评" ? normalizeDirectSite(row.site) : normalizeSite(row.site);
+    row.site = orderTypeLabel(row.type) === "直评" ? normalizeDirectSite(row.site) : normalizeSite(row.site);
   }
   if (field === "asin") row.asin = extractAsin(row.asin);
-  if (field === "variant" && row.type === "VP") row.variant = normalizeVariant(row.variant);
+  if (field === "variant" && orderTypeLabel(row.type) === "VP真人") row.variant = normalizeVariant(row.variant);
+  if (field === "warranty") row.warranty = normalizeWarranty(row.warranty);
   row.errors = validateImportRow(row);
   saveState();
   render();
@@ -917,22 +1613,26 @@ function updatePreviewField(event) {
 
 function validateImportRow(row) {
   const errors = [];
+  const typeLabel = orderTypeLabel(row.type);
   if (!row.customerId && !String(row.customerName || "").trim()) errors.push("缺少客户，请在预览中选择或填写");
   if (!row.site) errors.push("缺少站点");
-  if (row.type === "VP") {
+  if (typeLabel === "VP真人") {
     if (!row.productName) errors.push("缺少产品名");
     if (!row.keyword) errors.push("缺少关键词");
     if (!row.asin) errors.push("缺少 ASIN");
     if (!row.price) errors.push("缺少价格");
     if (!row.store) errors.push("缺少店铺");
     if (!row.project) errors.push("缺少项目");
-  } else {
+  } else if (typeLabel === "直评") {
     if (!row.asin) errors.push("缺少链接或 ASIN");
     if (!row.reviewTitle) errors.push("缺少评价标题");
     if (!row.reviewContent) errors.push("缺少评价内容");
     if (!row.warranty) errors.push("缺少质保");
+  } else {
+    if (!row.asin) errors.push("缺少 ASIN");
+    if (!row.productName) errors.push("缺少产品名");
   }
-  if (!row.productImage) errors.push("缺少产品图片");
+  if (typeLabel === "VP真人" && !row.productImage) errors.push("缺少产品图片");
   return errors;
 }
 
@@ -944,19 +1644,27 @@ function escapeAttr(value) {
     .replaceAll(">", "&gt;");
 }
 
+function detectImportType(text) {
+  const source = String(text || "");
+  if (/评价标题|评价内容|质保/.test(source)) return "直评";
+  if (/关键词|店铺名|核对ASIN|下单要求|特殊备注/.test(source)) return "VP真人";
+  const firstRow = parseClipboardTable(source).find((row) => row.some(Boolean)) || [];
+  const cells = firstRow.map((x) => x.trim()).filter(Boolean);
+  return cells.length >= 9 ? "VP真人" : "直评";
+}
+
 function parsePastedRows(text, type) {
-  const lines = text.split(/\r?\n/).filter((line) => line.trim());
-  if (!lines.length) return [];
-  const table = lines.map((line) => line.split("\t").map((x) => x.trim()));
+  const table = parseClipboardTable(text).filter((row) => row.some((cell) => String(cell).trim()));
+  if (!table.length) return [];
   const headerIndex = table.findIndex((row) => row.some((cell) => /站点|产品名|链接|ASIN|核对ASIN|评价标题/.test(cell)));
   if (headerIndex < 0) {
-    return type === "VP" ? table.flatMap(parseVpRowByPosition) : [];
+    return orderTypeLabel(type) === "VP真人" ? table.flatMap(parseVpRowByPosition) : table.map(parseDirectRowByPosition);
   }
   const headers = table[headerIndex];
   const dataRows = table.slice(headerIndex + 1);
   return dataRows
     .filter((row) => row.some(Boolean) && !String(row[0]).includes("示例行"))
-    .flatMap((row) => type === "VP" ? parseVpRow(headers, row) : [parseDirectRow(headers, row)])
+    .flatMap((row) => orderTypeLabel(type) === "VP真人" ? parseVpRow(headers, row) : [parseGenericImportRow(headers, row, type)])
     .filter(Boolean);
 }
 
@@ -965,24 +1673,26 @@ function headerValue(headers, row, names) {
   return idx >= 0 ? row[idx] || "" : "";
 }
 
-function parseDirectRow(headers, row) {
+function parseGenericImportRow(headers, row, type) {
+  const typeLabel = orderTypeLabel(type);
+  if (typeLabel === "直评") return parseDirectRow(headers, row);
   const customer = visibleCustomers()[0];
-  const site = normalizeDirectSite(headerValue(headers, row, ["站点"]));
-  const link = headerValue(headers, row, ["链接", "ASIN"]);
-  const title = headerValue(headers, row, ["评价标题"]);
-  const content = headerValue(headers, row, ["评价内容"]);
-  const warrantyRaw = headerValue(headers, row, ["质保"]);
-  const warranty = /30/.test(warrantyRaw) ? "30天" : /7/.test(warrantyRaw) ? "7天" : "";
   const parsed = {
-    type: "直评",
+    type: typeLabel,
     customerId: customer?.id || "",
     customerName: customer?.name || "",
-    site,
-    asin: extractAsin(link),
-    project: "直评",
-    warranty,
-    reviewTitle: title,
-    reviewContent: content,
+    platform: "亚马逊",
+    site: normalizeSite(headerValue(headers, row, ["站点"])),
+    productName: headerValue(headers, row, ["产品名", "产品"]),
+    keyword: headerValue(headers, row, ["关键词"]),
+    price: headerValue(headers, row, ["价格"]),
+    store: headerValue(headers, row, ["店铺"]),
+    variant: normalizeVariant(headerValue(headers, row, ["变体"])),
+    asin: extractAsin(headerValue(headers, row, ["核对ASIN", "ASIN", "链接"])),
+    project: typeLabel,
+    requirement: headerValue(headers, row, ["下单要求", "要求", "备注"]),
+    requirementRemark: headerValue(headers, row, ["下单要求", "要求"]),
+    remark: normalizeRemark(headerValue(headers, row, ["特殊备注", "备注"])),
     productImage: "",
     channelName: "待排渠道",
   };
@@ -990,12 +1700,102 @@ function parseDirectRow(headers, row) {
   return parsed;
 }
 
+function parseDirectRow(headers, row) {
+  return buildDirectImportRow({
+    site: headerValue(headers, row, ["站点"]),
+    link: headerValue(headers, row, ["链接", "ASIN"]),
+    title: headerValue(headers, row, ["评价标题"]),
+    content: headerValue(headers, row, ["评价内容"]),
+    warrantyRaw: headerValue(headers, row, ["质保"]),
+  });
+}
+
+function parseDirectRowByPosition(row) {
+  const [site, link, title, content, maybeCommentImage, maybeWarranty] = row;
+  const warrantyRaw = maybeWarranty || (/质保|天|30|7/.test(String(maybeCommentImage || "")) ? maybeCommentImage : "");
+  return buildDirectImportRow({
+    site,
+    link,
+    title,
+    content,
+    warrantyRaw,
+  });
+}
+
+function buildDirectImportRow({ site, link, title, content, warrantyRaw }) {
+  const customer = visibleCustomers()[0];
+  const parsed = {
+    type: "直评",
+    customerId: customer?.id || "",
+    customerName: customer?.name || "",
+    platform: "亚马逊",
+    site: normalizeDirectSite(site),
+    asin: extractAsin(link),
+    project: "5星",
+    quantity: 1,
+    warranty: normalizeWarranty(warrantyRaw),
+    reviewTitle: title || "",
+    reviewContent: content || "",
+    productImage: "",
+    channelName: "待排渠道",
+  };
+  parsed.errors = validateImportRow(parsed);
+  return parsed;
+}
+
+function normalizeWarranty(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/30/.test(raw)) return "30天";
+  if (/7/.test(raw)) return "7天";
+  return raw;
+}
+
+function parseClipboardTable(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let inQuotes = false;
+  const source = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === '"' && inQuotes && next === '"') {
+      cell += '"';
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (char === "\t" && !inQuotes) {
+      row.push(cell.trim());
+      cell = "";
+      continue;
+    }
+    if (char === "\n" && !inQuotes) {
+      row.push(cell.trim());
+      rows.push(row);
+      row = [];
+      cell = "";
+      continue;
+    }
+    cell += char;
+  }
+
+  row.push(cell.trim());
+  rows.push(row);
+  return rows;
+}
+
 function parseVpRow(headers, row) {
   const requirement = headerValue(headers, row, ["下单要求", "项目"]);
   const specialRemark = headerValue(headers, row, ["特殊备注", "备注"]);
   const projects = expandVpRequirement(requirement);
   const base = {
-    type: "VP",
+    type: "VP真人",
     customerId: "",
     customerName: "",
     platform: "亚马逊",
@@ -1027,19 +1827,19 @@ function parseVpRowByPosition(row) {
 
   const customer = visibleCustomers()[0];
   const siteRaw = cleaned[0] || "";
-  const productName = cleaned[2] || "";
-  const keyword = cleaned[3] || "";
-  const price = cleaned[4] || "";
-  const store = cleaned[5] || "";
-  const variant = normalizeVariant(cleaned[6]);
-  const asin = extractAsin(cleaned[7] || "");
-  const requirement = cleaned[8] || "";
-  const specialRemark = cleaned[9] || "";
+  const productName = cleaned[1] || "";
+  const keyword = cleaned[2] || "";
+  const price = cleaned[3] || "";
+  const store = cleaned[4] || "";
+  const variant = normalizeVariant(cleaned[5]);
+  const asin = extractAsin(cleaned[6] || "");
+  const requirement = cleaned[7] || "";
+  const specialRemark = cleaned[8] || "";
   const projects = expandVpRequirement(requirement);
   const requirementRemark = extractVpRemark(requirement, specialRemark);
 
   const base = {
-    type: "VP",
+    type: "VP真人",
     customerId: "",
     customerName: "",
     platform: "亚马逊",
@@ -1147,6 +1947,7 @@ function expandVpRequirement(text) {
 function renderFinance() {
   const pending = state.orders.filter((o) => !o.voided && o.payoutStatus !== "已付款");
   const total = pending.reduce((sum, o) => sum + Number(o.payable || 0), 0);
+  const canSeeChannel = ["admin", "backend", "finance"].includes(currentUser().role);
   return `
     <section class="section">
       <div class="section-head"><h2>合并付款申请雏形</h2><span class="hint">后端批量选择后系统自动计算总额</span></div>
@@ -1154,7 +1955,7 @@ function renderFinance() {
       <div class="table-wrap">
         <table>
           <thead><tr><th>订单号</th><th>类型</th><th>渠道</th><th>应付款</th><th>付款状态</th></tr></thead>
-          <tbody>${pending.map((o) => `<tr><td>${o.orderNo}</td><td>${o.type}</td><td>${o.channelName || "-"}</td><td>¥${money(o.payable)}</td><td>${o.payoutStatus}</td></tr>`).join("")}</tbody>
+          <tbody>${pending.map((o) => `<tr><td>${o.orderNo}</td><td>${o.type}</td><td>${canSeeChannel ? o.channelName || "-" : "不可见"}</td><td>¥${money(o.payable)}</td><td>${o.payoutStatus}</td></tr>`).join("")}</tbody>
         </table>
       </div>
     </section>
@@ -1167,7 +1968,7 @@ function renderPricing() {
   const isAdmin = currentUser().role === "admin";
   return `
     <section class="section">
-      <div class="section-head"><h2>直评亚马逊统一价格</h2><span class="hint">${isAdmin ? "管理员可修改，演示版暂为只读展示" : "仅管理员可修改"}</span></div>
+      <div class="section-head"><h2>直评业务报价</h2><span class="hint">${isAdmin ? "管理员可修改，演示版暂为只读展示" : "仅管理员可修改"}</span></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>站点</th><th>7天质保</th><th>30天质保</th></tr></thead>
@@ -1176,7 +1977,7 @@ function renderPricing() {
       </div>
     </section>
     <section class="section">
-      <div class="section-head"><h2>VP 佣金模板</h2></div>
+      <div class="section-head"><h2>VP 真人业务报价</h2></div>
       <div class="grid cols-3">${Object.entries(state.pricing.vpCommissions).map(([k, v]) => `<div class="metric"><span>${k}</span><strong>${v}</strong></div>`).join("")}</div>
     </section>
   `;
