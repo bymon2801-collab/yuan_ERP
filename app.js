@@ -30,6 +30,14 @@ const navItems = [
 const vpPlatforms = ["亚马逊", "沃尔玛", "TK", "SHEIN", "TEMU"];
 const vpSites = ["美国", "加拿大", "英国", "德国", "意大利", "法国", "西班牙", "日本", "澳大利亚", "中东"];
 const vpProjects = ["免评", "点星", "feedback", "文评", "图评", "视频"];
+const exchangeRateItems = [
+  { key: "USD", label: "美国", currency: "美元" },
+  { key: "GBP", label: "英国", currency: "英镑" },
+  { key: "EUR", label: "欧元", currency: "欧元" },
+  { key: "JPY", label: "日本", currency: "日元" },
+  { key: "CAD", label: "加拿大", currency: "加币" },
+  { key: "AUD", label: "澳大利亚", currency: "澳币" },
+];
 const orderTypes = [
   { key: "direct", label: "直评", prefix: "CP" },
   { key: "vp", label: "VP真人", legacy: "VP", prefix: "VP" },
@@ -254,6 +262,7 @@ function loadState() {
         { site: "JA", warranty7: 50, warranty30: 90 },
       ],
       vpCommissions: { 免评: 30, 点星: 40, feedback: 40, 文评: 80, 图评: 100, 视频: 150 },
+      exchangeRates: defaultExchangeRates(),
     },
     importPreview: [],
   };
@@ -458,10 +467,33 @@ function normalizeState(next) {
   next.orderSummary.filters ||= {};
   next.orderSummary.showVoided ||= false;
   next.orderSummary.expandedBatchIds ||= {};
+  next.orderSummary.completedFrom ||= "";
+  next.orderSummary.completedTo ||= "";
+  next.orderSummary.exportUserId ||= "";
   next.dispatchBuilder ||= null;
   next.dispatchDraft = normalizeDispatchDraft(next.dispatchDraft);
   next.pendingVoidOrderId ||= "";
+  next.pricing ||= {};
+  next.pricing.direct ||= [];
+  next.pricing.vpCommissions ||= {};
+  next.pricing.exchangeRates ||= defaultExchangeRates();
+  exchangeRateItems.forEach((item) => {
+    if (!next.pricing.exchangeRates[item.key]) next.pricing.exchangeRates[item.key] = defaultExchangeRates()[item.key];
+  });
   return next;
+}
+
+function defaultExchangeRates() {
+  return {
+    USD: 7.20,
+    GBP: 9.10,
+    EUR: 7.80,
+    JPY: 0.050,
+    CAD: 5.25,
+    AUD: 4.75,
+    updatedAt: "",
+    source: "参考",
+  };
 }
 
 function normalizeDispatchDraft(draft) {
@@ -648,19 +680,20 @@ function rankingFor(date) {
   const perf = performanceOn(date);
   return Object.entries(perf)
     .map(([userId, amount]) => ({ user: users.find((u) => u.id === userId), amount }))
-    .filter((x) => x.user)
+    .filter((x) => x.user && x.user.role !== "admin")
     .sort((a, b) => b.amount - a.amount);
 }
 
 function renderDashboard() {
   const orders = visibleOrders().filter((o) => !o.voided);
-  const todayRank = rankingFor(today());
-  const champs = [today(-1), today(-2), today(-3)].map((d) => ({ date: d, item: rankingFor(d)[0] }));
+  const todayRank = dashboardRankRows(today());
+  const champs = [today(-1), today(-2), today(-3)].map((d) => ({ date: d, item: rankingFor(d).find((row) => row.amount >= 2000) }));
   const totalPerformance = orders.reduce((sum, o) => sum + calculablePerformance(o), 0);
   const pendingCollection = orders.filter((o) => o.paymentStatus !== "已收款").length;
   return `
+    ${currentUser().role === "admin" ? renderAdminDashboardPanel() : ""}
     <section class="section">
-      <div class="section-head"><h2>近三天业绩冠军</h2><span class="hint">所有人可见，不展示客户和订单明细</span></div>
+      <div class="section-head"><h2>近三天销冠</h2><span class="hint">每日业绩满 ¥2,000 后参与争夺，管理员不参与</span></div>
       <div class="grid cols-3">
         ${champs
           .map(({ date, item }) => `
@@ -674,25 +707,120 @@ function renderDashboard() {
       </div>
     </section>
     <section class="section">
-      <div class="section-head"><h2>当天实时业绩排名</h2><span class="hint">最后更新：${new Date().toLocaleTimeString("zh-CN")}</span></div>
-      ${todayRank.length ? renderRankTable(todayRank) : `<div class="empty">今天还没有员工业绩</div>`}
+      <div class="section-head"><h2>当天实时业绩排名</h2><span class="hint">固定展示前三名，最后更新：${new Date().toLocaleTimeString("zh-CN")}</span></div>
+      ${renderRankTable(todayRank)}
     </section>
     <section class="grid cols-3">
       <div class="metric"><span>可见订单数</span><strong>${orders.length}</strong></div>
       <div class="metric"><span>可见客户数</span><strong>${visibleCustomers().length}</strong></div>
       <div class="metric"><span>累计业绩</span><strong>¥${money(totalPerformance)}</strong></div>
       <div class="metric"><span>待催款订单</span><strong>${pendingCollection}</strong></div>
-      <div class="metric"><span>今日奖励资格线</span><strong>¥2,000</strong></div>
-      <div class="metric"><span>拓客奖励资格线</span><strong>10 个直客</strong></div>
+      <div class="metric"><span>销冠参与线</span><strong>¥2,000</strong></div>
+      <div class="metric"><span>次日晨会奖励</span><strong>¥100</strong></div>
     </section>
   `;
+}
+
+function dashboardRankRows(date) {
+  const ranked = rankingFor(date);
+  const staff = users.filter((user) => user.role !== "admin");
+  const rows = [...ranked];
+  staff.forEach((user) => {
+    if (!rows.some((row) => row.user.id === user.id)) rows.push({ user, amount: 0 });
+  });
+  while (rows.length < 3) rows.push({ user: { name: "暂无员工", team: "-" }, amount: 0, empty: true });
+  return rows.slice(0, 3);
+}
+
+function monthKey(date = today()) {
+  return String(date).slice(0, 7);
+}
+
+function isThisMonth(value) {
+  return String(value || "").slice(0, 7) === monthKey();
+}
+
+function dashboardOrderDate(order) {
+  return String(submittedAtOf(order)).slice(0, 10);
+}
+
+function dashboardCompletedDate(order) {
+  return order.completedAt || order.performanceAt || order.acceptedAt || dashboardOrderDate(order);
+}
+
+function dashboardOrdersByType(typeLabel) {
+  return state.orders.filter((order) => !order.voided && orderTypeLabel(order.type) === typeLabel);
+}
+
+function renderAdminDashboardPanel() {
+  const direct = dashboardOrdersByType("直评");
+  const vp = dashboardOrdersByType("VP真人");
+  const directToday = direct.filter((order) => dashboardOrderDate(order) === today()).length;
+  const vpToday = vp.filter((order) => dashboardOrderDate(order) === today()).length;
+  const directMonthDone = direct.filter((order) => isFinanciallyComplete(order) && isThisMonth(dashboardCompletedDate(order))).length;
+  const vpMonthDone = vp.filter((order) => isFinanciallyComplete(order) && isThisMonth(dashboardCompletedDate(order))).length;
+  const directMonthProfit = direct
+    .filter((order) => isFinanciallyComplete(order) && isThisMonth(dashboardCompletedDate(order)))
+    .reduce((sum, order) => sum + calculablePerformance(order), 0);
+  const vpMonthProfit = vp
+    .filter((order) => isFinanciallyComplete(order) && isThisMonth(dashboardCompletedDate(order)))
+    .reduce((sum, order) => sum + calculablePerformance(order), 0);
+  const newCustomersToday = state.customers.filter((customer) => customer.createdAt === today()).length;
+  const newCustomersMonth = state.customers.filter((customer) => isThisMonth(customer.createdAt)).length;
+  const teams = ["一组", "二组", "三组", "四组"];
+  return `
+    <section class="section admin-dashboard">
+      <div class="section-head"><h2>管理员经营仪表盘</h2><span class="hint">按财务完成订单计算利润和业绩</span></div>
+      <div class="admin-dashboard-top">
+        <div class="admin-kpi-list">
+          ${renderAdminKpiRow("当天直评订单数", directToday)}
+          ${renderAdminKpiRow("本月直评订单已完成", `${directMonthDone}/2500`)}
+          ${renderAdminKpiRow("本月直评利润", money(directMonthProfit))}
+          ${renderAdminKpiRow("当天VP订单数", vpToday)}
+          ${renderAdminKpiRow("本月VP订单已完成", `${vpMonthDone}/200`)}
+          ${renderAdminKpiRow("本月VP订单利润", money(vpMonthProfit))}
+        </div>
+        <div class="admin-kpi-list compact">
+          ${renderAdminKpiRow("新增客户量", newCustomersToday)}
+          ${renderAdminKpiRow("本月新增客户量", newCustomersMonth)}
+          ${renderAdminKpiRow("累计合作客户量", state.customers.length)}
+        </div>
+      </div>
+      <div class="admin-team-title">本月小组累计业绩</div>
+      <div class="table-wrap admin-team-table">
+        <table>
+          <thead><tr><th>小组</th><th>直评业绩</th><th>VP业绩</th><th>合计</th></tr></thead>
+          <tbody>
+            ${teams.map((team) => {
+              const directAmount = teamMonthPerformance(team, "直评");
+              const vpAmount = teamMonthPerformance(team, "VP真人");
+              return `<tr><td>${team}</td><td>¥${money(directAmount)}</td><td>¥${money(vpAmount)}</td><td><strong>¥${money(directAmount + vpAmount)}</strong></td></tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderAdminKpiRow(label, value) {
+  return `<div class="admin-kpi-row"><span>${label}：</span><strong>${value}</strong></div>`;
+}
+
+function teamMonthPerformance(team, typeLabel) {
+  const teamUserIds = users.filter((user) => user.team === team).map((user) => user.id);
+  return state.orders
+    .filter((order) => !order.voided && orderTypeLabel(order.type) === typeLabel)
+    .filter((order) => teamUserIds.includes(order.frontendId))
+    .filter((order) => isFinanciallyComplete(order) && isThisMonth(dashboardCompletedDate(order)))
+    .reduce((sum, order) => sum + calculablePerformance(order), 0);
 }
 
 function renderRankTable(items) {
   return `
     <div class="table-wrap">
       <table>
-        <thead><tr><th>排名</th><th>员工</th><th>小组</th><th>实时业绩</th><th>奖励资格</th></tr></thead>
+        <thead><tr><th>排名</th><th>员工</th><th>小组</th><th>当天业绩</th></tr></thead>
         <tbody>
           ${items
             .map((row, index) => `
@@ -701,7 +829,6 @@ function renderRankTable(items) {
                 <td>${row.user.name}</td>
                 <td>${row.user.team}</td>
                 <td>¥${money(row.amount)}</td>
-                <td>${row.amount > 2000 ? `<span class="tag green">入围</span>` : `<span class="tag gray">未入围</span>`}</td>
               </tr>
             `)
             .join("")}
@@ -716,6 +843,7 @@ function bindDashboard() {}
 function renderCustomers() {
   const user = currentUser();
   const rows = visibleCustomers();
+  const adminView = user.role === "admin";
   return `
     <section class="section">
       <div class="section-head"><h2>新增客户</h2><span class="hint">前端确认提交后，联系方式只对管理员可见</span></div>
@@ -734,17 +862,19 @@ function renderCustomers() {
       <div class="section-head"><h2>客户列表</h2><span class="hint">${user.role === "admin" ? "管理员可见联系方式" : "联系方式已隐藏"}</span></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>客户编号</th><th>客户</th><th>联系方式</th><th>店铺</th><th>状态</th><th>累计成交</th><th>备注</th></tr></thead>
+          <thead><tr><th>客户编号</th><th>客户</th>${adminView ? "<th>归属</th>" : ""}<th>联系方式</th><th>店铺</th><th>状态</th><th>累计成交</th>${adminView ? "<th>业绩</th>" : ""}<th>备注</th></tr></thead>
           <tbody>
             ${rows
               .map((c) => `
                 <tr>
                   <td>${c.customerNo}</td>
                   <td>${c.name}</td>
+                  ${adminView ? `<td>${customerOwnerName(c)}</td>` : ""}
                   <td>${user.role === "admin" ? `${c.wechat}<br>${c.phone}` : "已隐藏"}</td>
                   <td>${c.store}</td>
                   <td><span class="tag ${c.status === "已作废" ? "red" : "green"}">${c.status}</span></td>
-                  <td>¥${money(c.totalDealAmount)}</td>
+                  <td>¥${money(customerDealAmount(c.id))}</td>
+                  ${adminView ? `<td>¥${money(customerPerformance(c.id))}</td>` : ""}
                   <td>${c.remark || ""}</td>
                 </tr>
               `)
@@ -754,6 +884,23 @@ function renderCustomers() {
       </div>
     </section>
   `;
+}
+
+function customerOwnerName(customer) {
+  const owner = users.find((u) => u.id === customer.ownerId);
+  return owner ? `${owner.name}<br><span class="hint">${owner.team}</span>` : "-";
+}
+
+function customerPerformance(customerId) {
+  return state.orders
+    .filter((order) => !order.voided && order.customerId === customerId && isFinanciallyComplete(order))
+    .reduce((sum, order) => sum + calculablePerformance(order), 0);
+}
+
+function customerDealAmount(customerId) {
+  return state.orders
+    .filter((order) => !order.voided && order.customerId === customerId && isFinanciallyComplete(order))
+    .reduce((sum, order) => sum + Number(order.received || 0), 0);
 }
 
 function bindCustomers() {
@@ -785,7 +932,7 @@ function renderOrders() {
   const user = currentUser();
   const query = state.orderSummary.query || "";
   const expandedType = state.orderSummary.expandedType || "";
-  const summaryOrders = filterOrdersByQuery(orders, query);
+  const summaryOrders = filterOrdersByCompletionDate(filterOrdersByQuery(orders, query));
   const activeType = expandedType && orderTypes.find((t) => t.label === expandedType || t.legacy === expandedType);
   return `
     ${user.role === "leader" ? renderLeaderOrderSummary(summaryOrders) : ""}
@@ -793,8 +940,12 @@ function renderOrders() {
       <div class="section-head"><h2>订单查询</h2><span class="hint">${user.role === "frontend" ? "仅展示个人订单" : user.role === "leader" ? "展示本组订单" : "按角色权限展示可见订单"}</span></div>
       <div class="toolbar">
         <input id="orderSearch" value="${escapeAttr(query)}" placeholder="搜索订单号、客户、产品、ASIN、项目" />
+        <input id="completedFrom" type="date" value="${escapeAttr(state.orderSummary.completedFrom || "")}" title="完成时间开始" />
+        <input id="completedTo" type="date" value="${escapeAttr(state.orderSummary.completedTo || "")}" title="完成时间结束" />
+        ${user.role === "admin" ? renderExportUserSelect() : ""}
         <button class="btn primary" id="runOrderSearch">查询</button>
         <button class="btn ghost" id="clearOrderSearch">清空</button>
+        <button class="btn ghost" id="exportOrders">导出订单</button>
         ${activeType ? `<button class="btn ghost" id="backOrderSummary">返回四类汇总</button>` : ""}
         <button class="btn ghost toolbar-right" id="toggleVoidedOrders">${state.orderSummary.showVoided ? "返回全部订单" : "作废订单列表"}</button>
       </div>
@@ -805,6 +956,15 @@ function renderOrders() {
         ? renderExpandedOrderType(activeType, summaryOrders)
         : orderTypes.map((type) => renderOrderTypePreview(type, summaryOrders)).join("")
     }
+  `;
+}
+
+function renderExportUserSelect() {
+  return `
+    <select id="exportUserId" title="导出人员">
+      <option value="">全部人员</option>
+      ${users.map((user) => `<option value="${user.id}" ${state.orderSummary.exportUserId === user.id ? "selected" : ""}>${user.name}</option>`).join("")}
+    </select>
   `;
 }
 
@@ -901,8 +1061,11 @@ function ordersForType(orders, type) {
 function mergeBatchOrders(orders) {
   const merged = new Map();
   orders.forEach((order) => {
+    const typeLabel = orderTypeLabel(order.type);
     const key = order.batchId
-      ? [order.batchId, orderTypeLabel(order.type), order.customerId, order.asin, order.productName].join("|")
+      ? typeLabel === "直评"
+        ? [order.batchId, typeLabel, order.customerId].join("|")
+        : [order.batchId, typeLabel, order.customerId, order.asin, order.productName].join("|")
       : order.id;
     if (!merged.has(key)) {
       merged.set(key, { ...order, projectLines: [...projectLinesOf(order)], batchOrders: [order] });
@@ -930,6 +1093,22 @@ function filterOrdersByQuery(orders, query) {
       .join(" ")
       .toLowerCase()
       .includes(keyword);
+  });
+}
+
+function completedDateOf(order) {
+  if (!isFinanciallyComplete(order)) return "";
+  return String(order.completedAt || order.performanceAt || order.acceptedAt || dashboardOrderDate(order)).slice(0, 10);
+}
+
+function filterOrdersByCompletionDate(orders) {
+  const from = state.orderSummary.completedFrom || "";
+  const to = state.orderSummary.completedTo || "";
+  if (!from && !to) return orders;
+  return orders.filter((order) => {
+    const completed = completedDateOf(order);
+    if (!completed) return false;
+    return (!from || completed >= from) && (!to || completed <= to);
   });
 }
 
@@ -1112,6 +1291,9 @@ function renderBatchDetailRows(order) {
 function bindOrders() {
   document.querySelector("#runOrderSearch").addEventListener("click", () => {
     state.orderSummary.query = document.querySelector("#orderSearch").value;
+    state.orderSummary.completedFrom = document.querySelector("#completedFrom").value;
+    state.orderSummary.completedTo = document.querySelector("#completedTo").value;
+    state.orderSummary.exportUserId = document.querySelector("#exportUserId")?.value || "";
     saveState();
     render();
   });
@@ -1124,8 +1306,19 @@ function bindOrders() {
   document.querySelector("#clearOrderSearch").addEventListener("click", () => {
     state.orderSummary.query = "";
     state.orderSummary.filters = {};
+    state.orderSummary.completedFrom = "";
+    state.orderSummary.completedTo = "";
+    state.orderSummary.exportUserId = "";
     saveState();
     render();
+  });
+  document.querySelector("#exportOrders").addEventListener("click", () => {
+    state.orderSummary.query = document.querySelector("#orderSearch").value;
+    state.orderSummary.completedFrom = document.querySelector("#completedFrom").value;
+    state.orderSummary.completedTo = document.querySelector("#completedTo").value;
+    state.orderSummary.exportUserId = document.querySelector("#exportUserId")?.value || "";
+    saveState();
+    exportOrders();
   });
   document.querySelector("#toggleVoidedOrders").addEventListener("click", () => {
     state.orderSummary.showVoided = !state.orderSummary.showVoided;
@@ -1235,6 +1428,79 @@ function updateOrderFilter(event) {
   render();
 }
 
+function exportOrders() {
+  const user = currentUser();
+  let orders = visibleOrders().filter((order) => !order.voided);
+  orders = filterOrdersByCompletionDate(filterOrdersByQuery(orders, state.orderSummary.query || ""));
+  if (user.role === "admin" && state.orderSummary.exportUserId) {
+    orders = orders.filter((order) => order.frontendId === state.orderSummary.exportUserId);
+  }
+  if (user.role !== "admin") {
+    orders = orders.filter((order) => order.frontendId === user.id);
+  }
+  const completed = orders.filter((order) => isFinanciallyComplete(order));
+  if (!completed.length) {
+    toast("没有可导出的已完成订单");
+    return;
+  }
+  const rows = completed.map(exportOrderRow);
+  const filename = `订单导出-${today()}.xlsx`;
+  if (window.XLSX) {
+    const sheet = window.XLSX.utils.json_to_sheet(rows);
+    const book = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(book, sheet, "订单");
+    window.XLSX.writeFile(book, filename);
+  } else {
+    downloadText(filename.replace(".xlsx", ".csv"), toCsv(rows));
+  }
+  log("导出订单", `${completed.length} 条`);
+}
+
+function exportOrderRow(order) {
+  const customer = state.customers.find((c) => c.id === order.customerId);
+  const creator = users.find((u) => u.id === order.frontendId);
+  const backend = users.find((u) => u.id === order.backendId);
+  return {
+    接单时间: fullDateTimeText(submittedAtOf(order)),
+    完成时间: completedDateOf(order) || "",
+    客户: customer?.name || "",
+    项目: exportProjectName(order),
+    业绩: calculablePerformance(order),
+    接单人: creator?.name || "",
+    对接人: backend?.name || "",
+  };
+}
+
+function fullDateTimeText(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function exportProjectName(order) {
+  const label = orderTypeLabel(order.type);
+  if (label === "直评") return "直评";
+  const project = order.project || label;
+  return project === "feedback" ? "FB" : project;
+}
+
+function toCsv(rows) {
+  const headers = Object.keys(rows[0] || {});
+  const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+  return [headers.join(","), ...rows.map((row) => headers.map((header) => escape(row[header])).join(","))].join("\n");
+}
+
+function downloadText(filename, content) {
+  const blob = new Blob(["\ufeff", content], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function nextOrderNo(typeMeta, offset = 0) {
   const d = new Date();
   const mmdd = `${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
@@ -1252,7 +1518,7 @@ function createOrderFromData(data, userId, meta = {}) {
   const paid = 0;
   return {
     id: uid("o"),
-    orderNo: nextOrderNo(typeMeta),
+    orderNo: meta.orderNo || nextOrderNo(typeMeta),
     type: normalizedType,
     batchId: meta.batchId || "",
     customerId: data.customerId,
@@ -1461,10 +1727,20 @@ function renderImport() {
       </form>
     </section>
     <section class="section">
-      <div class="section-head"><h2>表格内容识别</h2><span class="hint">直接复制表格单元格，系统按表头关键字识别</span></div>
-      <div class="toolbar">
-        <button class="btn primary" id="parsePaste">识别内容</button>
-        <button class="btn ghost" id="clearImport">清空</button>
+      <div class="section-head"><h2>批量导入订单</h2><span class="hint">复制粘贴和表格上传都支持，统一进入导入预览</span></div>
+      <div class="import-grid">
+        <div class="import-card">
+          <strong>复制粘贴识别</strong>
+          <span>适合从客户表格临时复制几行或几十行，保留表格单元格结构即可。</span>
+          <button class="btn primary" id="parsePaste">识别粘贴内容</button>
+        </div>
+        <label class="import-card upload-card" for="importFile">
+          <strong>表格上传识别</strong>
+          <span>适合直接上传员工标准模板，支持 .xlsx、.xls、.csv、.tsv、.txt。</span>
+          <input id="importFile" type="file" accept=".xlsx,.xls,.csv,.tsv,.txt" />
+          <em id="importFileName">选择表格文件</em>
+        </label>
+        <button class="btn ghost" id="clearImport">清空预览</button>
       </div>
       <div class="field">
         <label>从员工表格中复制有效区域后粘贴到这里</label>
@@ -1481,44 +1757,35 @@ function renderImport() {
 
 function renderImportPreview() {
   if (!state.importPreview.length) return `<div class="empty">暂无预览数据</div>`;
+  const previewType = orderTypeLabel(state.importPreview[0]?.type);
+  if (previewType === "直评") return renderDirectImportPreview();
+  if (previewType === "VP真人") return renderVpImportPreview();
+  return renderGenericImportPreview();
+}
+
+function renderDirectImportPreview() {
   return `
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>状态</th><th>类型</th><th>客户</th><th>站点</th><th>图片</th><th>产品/ASIN</th><th>关键词</th><th>价格/店铺</th><th>变体</th><th>项目</th><th>要求/备注</th><th>问题</th></tr></thead>
+      <table class="direct-preview-table">
+        <thead><tr><th>状态</th><th>客户 <button class="mini-square" data-fill-preview-customer title="用第一行客户填充本列">□</button></th><th>站点</th><th>DP短链</th><th>ASIN</th><th>评价标题</th><th>评价内容</th><th>评价图</th><th>质保</th><th>问题</th></tr></thead>
         <tbody>
           ${state.importPreview
             .map((row, index) => `
               <tr class="${row.errors.length ? "invalid-row" : ""}">
                 <td>${row.errors.length ? `<span class="tag red">不可提交</span>` : `<span class="tag green">可提交</span>`}</td>
-                <td><span class="tag">${orderTypeLabel(row.type)}</span></td>
                 <td>
                   <input class="cell-input" list="customerOptions" data-preview-field="${index}:customerName" value="${escapeAttr(row.customerName || "")}" placeholder="输入或选择客户" />
                 </td>
                 <td><input class="cell-input small" data-preview-field="${index}:site" value="${escapeAttr(row.site || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:link" value="${escapeAttr(row.link || "")}" placeholder="DP短链" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:asin" value="${escapeAttr(row.asin || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:reviewTitle" value="${escapeAttr(row.reviewTitle || "")}" /></td>
+                <td><textarea class="cell-input preview-textarea" data-preview-field="${index}:reviewContent">${escapeHtml(row.reviewContent || "")}</textarea></td>
                 <td>
-                  ${row.productImage
-                    ? `<img class="thumb" src="${row.productImage}" alt="产品图" />`
-                    : `<span class="tag ${orderTypeLabel(row.type) === "VP真人" ? "red" : ""}">${orderTypeLabel(row.type) === "VP真人" ? "缺图" : "可上传"}</span>`}
-                  <input class="image-input" type="file" accept="image/*" data-preview-image="${index}" />
+                  ${row.reviewImage ? `<img class="thumb" src="${row.reviewImage}" alt="评价图" />` : `<span class="tag">可上传</span>`}
+                  <input class="image-input" type="file" accept="image/*" data-preview-review-image="${index}" />
                 </td>
-                <td>
-                  <input class="cell-input" data-preview-field="${index}:productName" value="${escapeAttr(row.productName || "")}" />
-                  <input class="cell-input" data-preview-field="${index}:asin" value="${escapeAttr(row.asin || "")}" style="margin-top:6px" />
-                </td>
-                <td><input class="cell-input" data-preview-field="${index}:keyword" value="${escapeAttr(row.keyword || "")}" /></td>
-                <td>
-                  <input class="cell-input small" data-preview-field="${index}:price" value="${escapeAttr(row.price || "")}" />
-                  <input class="cell-input" data-preview-field="${index}:store" value="${escapeAttr(row.store || "")}" style="margin-top:6px" />
-                </td>
-                <td><input class="cell-input" data-preview-field="${index}:variant" value="${escapeAttr(row.variant || "")}" /></td>
-                <td>
-                  <input class="cell-input small" data-preview-field="${index}:project" value="${escapeAttr(row.project || "")}" />
-                  ${orderTypeLabel(row.type) === "直评" ? `<input class="cell-input small" data-preview-field="${index}:warranty" value="${escapeAttr(row.warranty || "")}" placeholder="质保天数" style="margin-top:6px" />` : ""}
-                </td>
-                <td>
-                  <input class="cell-input" data-preview-field="${index}:requirementRemark" value="${escapeAttr(row.requirementRemark || "")}" placeholder="要求" />
-                  <input class="cell-input" data-preview-field="${index}:remark" value="${escapeAttr(row.remark || "")}" placeholder="备注" style="margin-top:6px" />
-                </td>
+                <td><input class="cell-input small" data-preview-field="${index}:warranty" value="${escapeAttr(row.warranty || "")}" placeholder="质保天数" /></td>
                 <td>${row.errors.join("；")}</td>
               </tr>
             `)
@@ -1530,6 +1797,49 @@ function renderImportPreview() {
       ${visibleCustomers().map((c) => `<option value="${escapeAttr(c.name)}"></option>`).join("")}
     </datalist>
   `;
+}
+
+function renderVpImportPreview() {
+  return `
+    <div class="table-wrap">
+      <table class="vp-preview-table">
+        <thead><tr><th>状态</th><th>客户 <button class="mini-square" data-fill-preview-customer title="用第一行客户填充本列">□</button></th><th>平台</th><th>站点</th><th>主图</th><th>产品名</th><th>关键词</th><th>价格</th><th>店铺名</th><th>变体</th><th>核对ASIN</th><th>下单项目</th><th>要求</th><th>备注</th><th>问题</th></tr></thead>
+        <tbody>
+          ${state.importPreview
+            .map((row, index) => `
+              <tr class="${row.errors.length ? "invalid-row" : ""}">
+                <td>${row.errors.length ? `<span class="tag red">不可提交</span>` : `<span class="tag green">可提交</span>`}</td>
+                <td><input class="cell-input" list="customerOptions" data-preview-field="${index}:customerName" value="${escapeAttr(row.customerName || "")}" placeholder="输入或选择客户" /></td>
+                <td><input class="cell-input small" data-preview-field="${index}:platform" value="${escapeAttr(row.platform || "亚马逊")}" /></td>
+                <td><input class="cell-input small" data-preview-field="${index}:site" value="${escapeAttr(row.site || "")}" /></td>
+                <td>
+                  ${row.productImage ? `<img class="thumb" src="${row.productImage}" alt="主图" />` : `<span class="tag red">手动上传</span>`}
+                  <input class="image-input" type="file" accept="image/*" data-preview-image="${index}" />
+                </td>
+                <td><input class="cell-input" data-preview-field="${index}:productName" value="${escapeAttr(row.productName || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:keyword" value="${escapeAttr(row.keyword || "")}" /></td>
+                <td><input class="cell-input small" data-preview-field="${index}:price" value="${escapeAttr(row.price || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:store" value="${escapeAttr(row.store || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:variant" value="${escapeAttr(row.variant || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:asin" value="${escapeAttr(row.asin || "")}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:project" value="${escapeAttr(projectSummaryText({ quantity: row.quantity, project: row.project, type: row.type }))}" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:requirementRemark" value="${escapeAttr(row.requirementRemark || "")}" placeholder="例如：使用优惠券" /></td>
+                <td><input class="cell-input" data-preview-field="${index}:remark" value="${escapeAttr(row.remark || "")}" /></td>
+                <td>${row.errors.join("；")}</td>
+              </tr>
+            `)
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+    <datalist id="customerOptions">
+      ${visibleCustomers().map((c) => `<option value="${escapeAttr(c.name)}"></option>`).join("")}
+    </datalist>
+  `;
+}
+
+function renderGenericImportPreview() {
+  return `<div class="empty">无法判断表格类型，请确认表头包含直评字段“评价标题、评价内容”，或 VP 字段“关键词、价格、店铺/卖家”。</div>`;
 }
 
 function bindImport() {
@@ -1545,23 +1855,49 @@ function bindImport() {
   });
   document.querySelector("#parsePaste").addEventListener("click", () => {
     const text = document.querySelector("#pasteArea").value;
-    const type = detectImportType(text);
-    state.importPreview = parsePastedRows(text, type);
-    log("导入识别", `${type} / ${state.importPreview.length} 行`);
-    saveState();
-    render();
+    applyImportText(text, "粘贴识别");
+  });
+  document.querySelector("#importFile").addEventListener("change", async (event) => {
+    const file = event.currentTarget.files?.[0];
+    if (!file) return;
+    document.querySelector("#importFileName").textContent = file.name;
+    try {
+      const text = await readImportFile(file);
+      document.querySelector("#pasteArea").value = text;
+      applyImportText(text, `文件识别：${file.name}`);
+    } catch (error) {
+      toast(error.message || "文件识别失败");
+    }
   });
   document.querySelector("#clearImport").addEventListener("click", () => {
     state.importPreview = [];
     saveState();
     render();
   });
+  document.querySelector("[data-fill-preview-customer]")?.addEventListener("click", () => {
+    const firstName = String(state.importPreview[0]?.customerName || "").trim();
+    if (!firstName) {
+      toast("请先在第一行填写客户");
+      return;
+    }
+    const customer = state.customers.find((c) => c.name === firstName);
+    state.importPreview.forEach((row) => {
+      row.customerName = firstName;
+      row.customerId = customer?.id || "";
+      row.errors = validateImportRow(row);
+    });
+    saveState();
+    render();
+  });
   document.querySelector("#submitPreview").addEventListener("click", () => {
     const valid = state.importPreview.filter((r) => !r.errors.length);
     const batchId = uid("batch");
+    const directBatchOrderNo = valid.some((r) => orderTypeLabel(r.type) === "直评") ? nextOrderNo(orderTypes[0]) : "";
     valid.forEach((r) => {
       ensureImportCustomer(r);
-      state.orders.unshift(createOrderFromData(r, currentUser().id, { batchId }));
+      const meta = { batchId };
+      if (orderTypeLabel(r.type) === "直评") meta.orderNo = directBatchOrderNo;
+      state.orders.unshift(createOrderFromData(r, currentUser().id, meta));
     });
     log("批量提交订单", `${valid.length} 条`);
     state.importPreview = state.importPreview.filter((r) => r.errors.length);
@@ -1584,10 +1920,56 @@ function bindImport() {
       reader.readAsDataURL(file);
     });
   });
+  document.querySelectorAll("[data-preview-review-image]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const file = input.files?.[0];
+      const index = Number(input.dataset.previewReviewImage);
+      if (!file || !state.importPreview[index]) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        state.importPreview[index].reviewImage = reader.result;
+        state.importPreview[index].errors = validateImportRow(state.importPreview[index]);
+        saveState();
+        render();
+      };
+      reader.readAsDataURL(file);
+    });
+  });
   document.querySelectorAll("[data-preview-field]").forEach((input) => {
     input.addEventListener("change", updatePreviewField);
     input.addEventListener("blur", updatePreviewField);
   });
+}
+
+function applyImportText(text, action) {
+  const type = detectImportType(text);
+  if (!type) {
+    state.importPreview = [];
+    toast("无法判断表格类型：直评需包含评价标题和评价内容；VP需包含关键词、价格、店铺/卖家");
+    saveState();
+    render();
+    return;
+  }
+  state.importPreview = parsePastedRows(text, type);
+  log("导入识别", `${action} / ${type} / ${state.importPreview.length} 行`);
+  saveState();
+  render();
+}
+
+async function readImportFile(file) {
+  const name = file.name.toLowerCase();
+  if (/\.(csv|tsv|txt)$/.test(name)) return file.text();
+  if (!/\.(xlsx|xls)$/.test(name)) throw new Error("暂不支持该文件格式");
+  if (!window.XLSX) throw new Error("Excel 解析库未加载，请刷新页面后重试");
+  const buffer = await file.arrayBuffer();
+  const workbook = window.XLSX.read(buffer, { type: "array" });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error("表格文件没有工作表");
+  const rows = window.XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, defval: "" });
+  return rows
+    .filter((row) => row.some((cell) => String(cell).trim()))
+    .map((row) => row.map((cell) => String(cell || "").trim()).join("\t"))
+    .join("\n");
 }
 
 function updatePreviewField(event) {
@@ -1602,10 +1984,26 @@ function updatePreviewField(event) {
   }
   if (field === "site") {
     row.site = orderTypeLabel(row.type) === "直评" ? normalizeDirectSite(row.site) : normalizeSite(row.site);
+    if (orderTypeLabel(row.type) === "直评" && row.asin && !/^https?:\/\//i.test(String(row.link || ""))) {
+      row.link = normalizeDirectDpLink(row.site, row.link, row.asin);
+    }
   }
-  if (field === "asin") row.asin = extractAsin(row.asin);
+  if (field === "link" && !row.asin) row.asin = extractAsin(row.link);
+  if (field === "asin") {
+    row.asin = extractAsin(row.asin);
+    if (orderTypeLabel(row.type) === "直评" && !/^https?:\/\//i.test(String(row.link || ""))) {
+      row.link = normalizeDirectDpLink(row.site, row.link, row.asin);
+    }
+  }
   if (field === "variant" && orderTypeLabel(row.type) === "VP真人") row.variant = normalizeVariant(row.variant);
   if (field === "warranty") row.warranty = normalizeWarranty(row.warranty);
+  if (field === "project" && orderTypeLabel(row.type) === "VP真人") {
+    const match = String(row.project || "").match(/(\d+)\s*单?\s*(.+)/);
+    if (match) {
+      row.quantity = Math.max(1, Number(match[1]));
+      row.project = match[2].trim();
+    }
+  }
   row.errors = validateImportRow(row);
   saveState();
   render();
@@ -1617,6 +2015,7 @@ function validateImportRow(row) {
   if (!row.customerId && !String(row.customerName || "").trim()) errors.push("缺少客户，请在预览中选择或填写");
   if (!row.site) errors.push("缺少站点");
   if (typeLabel === "VP真人") {
+    if (!row.platform) errors.push("缺少平台");
     if (!row.productName) errors.push("缺少产品名");
     if (!row.keyword) errors.push("缺少关键词");
     if (!row.asin) errors.push("缺少 ASIN");
@@ -1644,49 +2043,80 @@ function escapeAttr(value) {
     .replaceAll(">", "&gt;");
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function detectImportType(text) {
-  const source = String(text || "");
-  if (/评价标题|评价内容|质保/.test(source)) return "直评";
-  if (/关键词|店铺名|核对ASIN|下单要求|特殊备注/.test(source)) return "VP真人";
-  const firstRow = parseClipboardTable(source).find((row) => row.some(Boolean)) || [];
-  const cells = firstRow.map((x) => x.trim()).filter(Boolean);
-  return cells.length >= 9 ? "VP真人" : "直评";
+  const table = parseClipboardTable(text).filter((row) => row.some((cell) => String(cell).trim()));
+  const analysis = analyzeImportTable(table);
+  if (analysis.type) return analysis.type;
+  const firstRow = table.find((row) => row.some(Boolean)) || [];
+  return firstRow.map((x) => x.trim()).filter(Boolean).length >= 9 ? "VP真人" : "";
 }
 
 function parsePastedRows(text, type) {
   const table = parseClipboardTable(text).filter((row) => row.some((cell) => String(cell).trim()));
   if (!table.length) return [];
-  const headerIndex = table.findIndex((row) => row.some((cell) => /站点|产品名|链接|ASIN|核对ASIN|评价标题/.test(cell)));
+  const analysis = analyzeImportTable(table);
+  const resolvedType = analysis.type || type;
+  if (!resolvedType) return [];
+  const headerIndex = analysis.headerIndex;
   if (headerIndex < 0) {
-    return orderTypeLabel(type) === "VP真人" ? table.flatMap(parseVpRowByPosition) : table.map(parseDirectRowByPosition);
+    return orderTypeLabel(resolvedType) === "VP真人" ? table.flatMap(parseVpRowByPosition) : table.map(parseDirectRowByPosition);
   }
   const headers = table[headerIndex];
   const dataRows = table.slice(headerIndex + 1);
   return dataRows
-    .filter((row) => row.some(Boolean) && !String(row[0]).includes("示例行"))
-    .flatMap((row) => orderTypeLabel(type) === "VP真人" ? parseVpRow(headers, row) : [parseGenericImportRow(headers, row, type)])
+    .filter((row) => row.some(Boolean) && !isExampleRow(row))
+    .flatMap((row) => orderTypeLabel(resolvedType) === "VP真人" ? parseVpRow(headers, row) : [parseGenericImportRow(headers, row, resolvedType)])
     .filter(Boolean);
 }
 
+function analyzeImportTable(table) {
+  const directHeaderIndex = table.findIndex((row) => hasHeader(row, ["评价标题"]) && hasHeader(row, ["评价内容"]));
+  if (directHeaderIndex >= 0) {
+    const headers = table[directHeaderIndex];
+    const dataRows = table.slice(directHeaderIndex + 1).filter((row) => row.some(Boolean) && !isExampleRow(row));
+    const hasDirectData = dataRows.some((row) => headerValue(headers, row, ["评价标题"]) && headerValue(headers, row, ["评价内容"]));
+    if (hasDirectData) return { type: "直评", headerIndex: directHeaderIndex };
+  }
+
+  const vpHeaderIndex = table.findIndex((row) => hasHeader(row, ["关键词"]) && hasHeader(row, ["价格", "售价"]) && hasHeader(row, ["店铺", "卖家"]));
+  if (vpHeaderIndex >= 0) return { type: "VP真人", headerIndex: vpHeaderIndex };
+
+  return { type: "", headerIndex: -1 };
+}
+
+function hasHeader(row, names) {
+  return row.some((cell) => names.some((name) => String(cell || "").replace(/\s+/g, "").includes(name)));
+}
+
+function isExampleRow(row) {
+  return row.some((cell) => /示例|样例|example|请删除/i.test(String(cell || "")));
+}
+
 function headerValue(headers, row, names) {
-  const idx = headers.findIndex((h) => names.some((n) => String(h).includes(n)));
+  const idx = headers.findIndex((h) => names.some((n) => String(h).replace(/\s+/g, "").includes(n)));
   return idx >= 0 ? row[idx] || "" : "";
 }
 
 function parseGenericImportRow(headers, row, type) {
   const typeLabel = orderTypeLabel(type);
   if (typeLabel === "直评") return parseDirectRow(headers, row);
-  const customer = visibleCustomers()[0];
   const parsed = {
     type: typeLabel,
-    customerId: customer?.id || "",
-    customerName: customer?.name || "",
+    customerId: "",
+    customerName: "",
     platform: "亚马逊",
     site: normalizeSite(headerValue(headers, row, ["站点"])),
-    productName: headerValue(headers, row, ["产品名", "产品"]),
+    productName: headerValue(headers, row, ["产品名", "产品简称", "产品"]),
     keyword: headerValue(headers, row, ["关键词"]),
-    price: headerValue(headers, row, ["价格"]),
-    store: headerValue(headers, row, ["店铺"]),
+    price: headerValue(headers, row, ["价格", "售价"]),
+    store: headerValue(headers, row, ["店铺名", "店铺", "卖家"]),
     variant: normalizeVariant(headerValue(headers, row, ["变体"])),
     asin: extractAsin(headerValue(headers, row, ["核对ASIN", "ASIN", "链接"])),
     project: typeLabel,
@@ -1701,11 +2131,15 @@ function parseGenericImportRow(headers, row, type) {
 }
 
 function parseDirectRow(headers, row) {
+  const link = headerValue(headers, row, ["DP短链", "短链", "链接"]);
+  const asin = headerValue(headers, row, ["ASIN"]) || extractAsin(link);
   return buildDirectImportRow({
     site: headerValue(headers, row, ["站点"]),
-    link: headerValue(headers, row, ["链接", "ASIN"]),
+    link,
+    asin,
     title: headerValue(headers, row, ["评价标题"]),
     content: headerValue(headers, row, ["评价内容"]),
+    reviewImage: headerValue(headers, row, ["评论图", "评价图"]),
     warrantyRaw: headerValue(headers, row, ["质保"]),
   });
 }
@@ -1718,29 +2152,55 @@ function parseDirectRowByPosition(row) {
     link,
     title,
     content,
+    reviewImage: /质保|天|30|7/.test(String(maybeCommentImage || "")) ? "" : maybeCommentImage,
     warrantyRaw,
   });
 }
 
-function buildDirectImportRow({ site, link, title, content, warrantyRaw }) {
-  const customer = visibleCustomers()[0];
+function buildDirectImportRow({ site, link, asin, title, content, reviewImage, warrantyRaw }) {
+  const normalizedSite = normalizeDirectSite(site);
+  const normalizedAsin = extractAsin(asin || link);
+  const normalizedLink = normalizeDirectDpLink(normalizedSite, link, normalizedAsin);
   const parsed = {
     type: "直评",
-    customerId: customer?.id || "",
-    customerName: customer?.name || "",
+    customerId: "",
+    customerName: "",
     platform: "亚马逊",
-    site: normalizeDirectSite(site),
-    asin: extractAsin(link),
+    site: normalizedSite,
+    link: normalizedLink,
+    asin: normalizedAsin,
     project: "5星",
     quantity: 1,
     warranty: normalizeWarranty(warrantyRaw),
     reviewTitle: title || "",
     reviewContent: content || "",
+    reviewImage: reviewImage || "",
     productImage: "",
     channelName: "待排渠道",
   };
   parsed.errors = validateImportRow(parsed);
   return parsed;
+}
+
+function normalizeDirectDpLink(site, link, asin) {
+  const raw = String(link || "").trim();
+  if (/^https?:\/\//i.test(raw)) return raw;
+  const code = normalizeDirectSite(site);
+  const cleanAsin = extractAsin(asin || raw);
+  if (!/^B0[A-Z0-9]{8}$/i.test(cleanAsin)) return raw === cleanAsin ? "" : raw;
+  const domains = {
+    US: "https://www.amazon.com/dp/",
+    CA: "https://www.amazon.ca/dp/",
+    UK: "https://www.amazon.co.uk/dp/",
+    DE: "https://www.amazon.de/dp/",
+    FR: "https://www.amazon.fr/dp/",
+    IT: "https://www.amazon.it/dp/",
+    ES: "https://www.amazon.es/dp/",
+    JA: "https://www.amazon.co.jp/dp/",
+    JP: "https://www.amazon.co.jp/dp/",
+    AU: "https://www.amazon.com.au/dp/",
+  };
+  return domains[code] ? `${domains[code]}${cleanAsin}` : "";
 }
 
 function normalizeWarranty(value) {
@@ -1793,17 +2253,17 @@ function parseClipboardTable(text) {
 function parseVpRow(headers, row) {
   const requirement = headerValue(headers, row, ["下单要求", "项目"]);
   const specialRemark = headerValue(headers, row, ["特殊备注", "备注"]);
-  const projects = expandVpRequirement(requirement);
+  const projects = consolidateProjectLines(expandVpRequirement(requirement).map((project) => ({ count: 1, project })));
   const base = {
     type: "VP真人",
     customerId: "",
     customerName: "",
     platform: "亚马逊",
     site: normalizeSite(headerValue(headers, row, ["站点"])),
-    productName: headerValue(headers, row, ["产品名"]),
+    productName: headerValue(headers, row, ["产品名", "产品简称", "产品"]),
     keyword: headerValue(headers, row, ["关键词"]),
-    price: headerValue(headers, row, ["价格"]),
-    store: headerValue(headers, row, ["店铺"]),
+    price: headerValue(headers, row, ["价格", "售价"]),
+    store: headerValue(headers, row, ["店铺名", "店铺", "卖家"]),
     variant: normalizeVariant(headerValue(headers, row, ["变体"])),
     asin: extractAsin(headerValue(headers, row, ["核对ASIN", "ASIN"])),
     requirement,
@@ -1812,12 +2272,12 @@ function parseVpRow(headers, row) {
     productImage: "",
     channelName: "待排渠道",
   };
-  const make = (project) => {
-    const item = { ...base, project };
+  const make = (line) => {
+    const item = { ...base, project: line.project, quantity: line.count };
     item.errors = validateImportRow(item);
     return item;
   };
-  return projects.length ? projects.map(make) : [make("")];
+  return projects.length ? projects.map(make) : [make({ count: 1, project: "" })];
 }
 
 function parseVpRowByPosition(row) {
@@ -1825,7 +2285,6 @@ function parseVpRowByPosition(row) {
   while (cleaned.length && cleaned[cleaned.length - 1] === "") cleaned.pop();
   if (!cleaned.length) return [];
 
-  const customer = visibleCustomers()[0];
   const siteRaw = cleaned[0] || "";
   const productName = cleaned[1] || "";
   const keyword = cleaned[2] || "";
@@ -1835,7 +2294,7 @@ function parseVpRowByPosition(row) {
   const asin = extractAsin(cleaned[6] || "");
   const requirement = cleaned[7] || "";
   const specialRemark = cleaned[8] || "";
-  const projects = expandVpRequirement(requirement);
+  const projects = consolidateProjectLines(expandVpRequirement(requirement).map((project) => ({ count: 1, project })));
   const requirementRemark = extractVpRemark(requirement, specialRemark);
 
   const base = {
@@ -1857,20 +2316,20 @@ function parseVpRowByPosition(row) {
     channelName: "待排渠道",
   };
 
-  const make = (project) => {
-    const item = { ...base, project };
+  const make = (line) => {
+    const item = { ...base, project: line.project, quantity: line.count };
     item.errors = validateImportRow(item);
     return item;
   };
 
-  return projects.length ? projects.map(make) : [make("")];
+  return projects.length ? projects.map(make) : [make({ count: 1, project: "" })];
 }
 
 function extractVpRemark(requirement, specialRemark) {
   const parts = [];
   const req = String(requirement || "");
   const cleanedReq = req
-    .replace(/\d+\s*单?\s*(免评|文评|图评|视频|点星|feedback)/gi, "")
+    .replace(/\d+\s*单?\s*(免评|文评|文字|文字评论|留评|图评|视频|点星|feedback)/gi, "")
     .replace(/[，,、；;]+/g, " ")
     .trim();
   if (cleanedReq) parts.push(cleanedReq);
@@ -1926,6 +2385,7 @@ function expandVpRequirement(text) {
   const patterns = [
     ["免评", /(\d+)\s*单?\s*免评/],
     ["文评", /(\d+)\s*单?\s*文评/],
+    ["文评", /(\d+)\s*单?\s*(留评|文字评论|文字)/],
     ["图评", /(\d+)\s*单?\s*图评/],
     ["视频", /(\d+)\s*单?\s*视频/],
     ["点星", /(\d+)\s*单?\s*点星/],
@@ -1977,13 +2437,59 @@ function renderPricing() {
       </div>
     </section>
     <section class="section">
-      <div class="section-head"><h2>VP 真人业务报价</h2></div>
+      <div class="section-head pricing-head">
+        <h2>VP 真人业务报价</h2>
+        ${renderExchangeRateStrip()}
+      </div>
       <div class="grid cols-3">${Object.entries(state.pricing.vpCommissions).map(([k, v]) => `<div class="metric"><span>${k}</span><strong>${v}</strong></div>`).join("")}</div>
     </section>
   `;
 }
 
-function bindPricing() {}
+function renderExchangeRateStrip() {
+  const rates = state.pricing.exchangeRates || defaultExchangeRates();
+  const updated = rates.updatedAt ? new Date(rates.updatedAt).toLocaleString("zh-CN", { hour12: false }) : "等待实时更新";
+  return `
+    <div class="exchange-strip" title="实时汇率：1 外币约等于多少人民币。接口不可用时显示参考值。">
+      <span class="exchange-title">实时各国汇率</span>
+      ${exchangeRateItems
+        .map((item) => `<span class="exchange-pill"><b>${item.label}</b>${formatExchangeRate(rates[item.key])}</span>`)
+        .join("")}
+      <span class="exchange-time">${updated}</span>
+    </div>
+  `;
+}
+
+function formatExchangeRate(value) {
+  const n = Number(value || 0);
+  if (!n) return "-";
+  return n < 0.1 ? n.toFixed(4) : n.toFixed(2);
+}
+
+function bindPricing() {
+  refreshExchangeRates();
+}
+
+async function refreshExchangeRates() {
+  if (state.pricing.exchangeRates?.updatedAt && Date.now() - new Date(state.pricing.exchangeRates.updatedAt).getTime() < 24 * 60 * 60 * 1000) return;
+  try {
+    const response = await fetch("https://api.frankfurter.app/latest?from=CNY&to=USD,GBP,EUR,JPY,CAD,AUD");
+    if (!response.ok) throw new Error("rate fetch failed");
+    const data = await response.json();
+    const nextRates = { ...defaultExchangeRates(), source: "Frankfurter", updatedAt: new Date().toISOString() };
+    exchangeRateItems.forEach((item) => {
+      const foreignPerCny = Number(data.rates?.[item.key]);
+      if (foreignPerCny) nextRates[item.key] = 1 / foreignPerCny;
+    });
+    state.pricing.exchangeRates = nextRates;
+    saveState();
+    if (state.activePage === "pricing") render();
+  } catch (error) {
+    state.pricing.exchangeRates ||= defaultExchangeRates();
+    state.pricing.exchangeRates.source = "参考";
+    saveState();
+  }
+}
 
 function renderLogs() {
   return `
