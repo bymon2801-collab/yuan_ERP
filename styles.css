@@ -721,6 +721,54 @@ tbody tr:hover td {
   margin-top: 12px;
 }
 
+.mt-8 {
+  margin-top: 8px;
+}
+
+.workflow-section {
+  display: grid;
+  gap: 12px;
+}
+
+.workflow-table {
+  min-width: 1320px;
+}
+
+.workflow-table input,
+.workflow-table select {
+  max-width: 220px;
+}
+
+.mini-label {
+  display: block;
+  margin: 8px 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mini-label:first-child {
+  margin-top: 0;
+}
+
+.action-stack {
+  display: grid;
+  gap: 8px;
+  min-width: 126px;
+}
+
+.action-stack .btn {
+  width: 100%;
+}
+
+.reject-note {
+  margin-top: 8px;
+  max-width: 180px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .dispatch-section {
   display: grid;
   gap: 12px;

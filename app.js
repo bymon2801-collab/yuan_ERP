@@ -480,7 +480,126 @@ function normalizeState(next) {
   exchangeRateItems.forEach((item) => {
     if (!next.pricing.exchangeRates[item.key]) next.pricing.exchangeRates[item.key] = defaultExchangeRates()[item.key];
   });
+  next.orders = (next.orders || []).map(normalizeOrderWorkflow);
   return next;
+}
+
+function normalizeOrderWorkflow(order) {
+  const next = { ...order };
+  next.workflow ||= {};
+  next.workflow.backendAcceptedAt ||= "";
+  next.workflow.backendCompletedAt ||= "";
+  next.workflow.customerPaymentProof ||= next.customerPaymentProof || "";
+  next.workflow.customerPaymentSubmittedAt ||= next.customerPaymentSubmittedAt || "";
+  next.workflow.customerPaymentSubmittedBy ||= next.customerPaymentSubmittedBy || "";
+  next.workflow.financeCollectionConfirmedAt ||= next.financeCollectionConfirmedAt || "";
+  next.workflow.financeCollectionConfirmedBy ||= next.financeCollectionConfirmedBy || "";
+  next.workflow.collectionRejectReason ||= "";
+  next.workflow.channelPaymentProof ||= next.channelPaymentProof || "";
+  next.workflow.payoutRequestSubmittedAt ||= next.payoutRequestSubmittedAt || "";
+  next.workflow.payoutRequestSubmittedBy ||= next.payoutRequestSubmittedBy || "";
+  next.workflow.payoutRequestStatus ||= next.payoutRequestStatus || (next.payoutStatus === "已付款" ? "已付款" : "待后端提交");
+  next.workflow.payeeName ||= next.payeeName || "";
+  next.workflow.payeeAccount ||= next.payeeAccount || "";
+  next.workflow.payeeMethod ||= next.payeeMethod || "微信";
+  next.workflow.financePayoutProof ||= next.financePayoutProof || "";
+  next.workflow.financePayoutConfirmedAt ||= next.financePayoutConfirmedAt || "";
+  next.workflow.financePayoutConfirmedBy ||= next.financePayoutConfirmedBy || "";
+  next.workflow.financeRejectReason ||= next.financeRejectReason || "";
+  if (next.paymentStatus === "已收款" && !next.workflow.financeCollectionConfirmedAt) {
+    next.workflow.financeCollectionConfirmedAt = next.completedAt || next.performanceAt || next.acceptedAt || today();
+    next.workflow.financeCollectionConfirmedBy = next.workflow.financeCollectionConfirmedBy || "u-fin";
+  }
+  if (next.payoutStatus === "已付款" && !next.workflow.financePayoutConfirmedAt) {
+    next.workflow.financePayoutConfirmedAt = next.completedAt || next.performanceAt || next.acceptedAt || today();
+    next.workflow.financePayoutConfirmedBy = next.workflow.financePayoutConfirmedBy || "u-fin";
+    next.workflow.payoutRequestStatus = "已付款";
+  }
+  return next;
+}
+
+function refreshOrderCompletion(order) {
+  order.performance = Number(order.received || 0) - Number(order.paid || 0);
+  if (!isFinanciallyComplete(order)) {
+    if (order.status === "已完成") order.status = "未完成";
+    return order;
+  }
+  const doneDate = today();
+  order.status = "已完成";
+  order.completedAt ||= doneDate;
+  order.performanceAt ||= doneDate;
+  return order;
+}
+
+function markBackendAccepted(order) {
+  order.workflow ||= {};
+  order.status = "处理中";
+  order.workflow.backendAcceptedAt ||= nowIso();
+  return order;
+}
+
+function markBackendHandled(order) {
+  order.workflow ||= {};
+  order.status = order.paymentStatus === "已收款" ? "待付款申请" : "待收款确认";
+  order.workflow.backendCompletedAt = nowIso();
+  return order;
+}
+
+function submitCustomerPaymentProof(order, proof) {
+  order.workflow ||= {};
+  order.workflow.customerPaymentProof = proof || order.workflow.customerPaymentProof;
+  order.workflow.customerPaymentSubmittedAt = nowIso();
+  order.workflow.customerPaymentSubmittedBy = currentUser()?.id || "";
+  order.paymentStatus = "待财务确认";
+  return order;
+}
+
+function submitPayoutRequest(order) {
+  order.workflow ||= {};
+  order.workflow.payoutRequestStatus = "待财务审核";
+  order.workflow.payoutRequestSubmittedAt = nowIso();
+  order.workflow.payoutRequestSubmittedBy = currentUser()?.id || "";
+  order.workflow.financeRejectReason = "";
+  order.payoutStatus = "待财务审核";
+  order.status = "待财务付款";
+  return order;
+}
+
+function confirmCollection(order, amount) {
+  order.workflow ||= {};
+  order.received = Number(amount || order.receivable || order.received || 0);
+  order.paymentStatus = "已收款";
+  order.workflow.financeCollectionConfirmedAt = nowIso();
+  order.workflow.financeCollectionConfirmedBy = currentUser()?.id || "";
+  order.workflow.collectionRejectReason = "";
+  return refreshOrderCompletion(order);
+}
+
+function rejectCollection(order, reason) {
+  order.workflow ||= {};
+  order.paymentStatus = "收款退回";
+  order.workflow.collectionRejectReason = reason || "收款凭证或金额异常";
+  return order;
+}
+
+function confirmPayout(order, amount) {
+  order.workflow ||= {};
+  order.paid = Number(amount || order.payable || order.paid || 0);
+  order.payoutStatus = "已付款";
+  order.workflow.payoutRequestStatus = "已付款";
+  order.workflow.financePayoutConfirmedAt = nowIso();
+  order.workflow.financePayoutConfirmedBy = currentUser()?.id || "";
+  order.workflow.financeRejectReason = "";
+  return refreshOrderCompletion(order);
+}
+
+function rejectPayout(order, reason) {
+  order.workflow ||= {};
+  order.payoutStatus = "财务已退回";
+  order.workflow.payoutRequestStatus = "财务已退回";
+  order.workflow.financeRejectReason = reason || "付款信息异常";
+  order.status = "付款退回待修正";
+  return order;
 }
 
 function defaultExchangeRates() {
@@ -1555,6 +1674,7 @@ function createOrderFromData(data, userId, meta = {}) {
     status: "待处理",
     paymentStatus: "未收款",
     payoutStatus: "未付款",
+    workflow: normalizeOrderWorkflow({ paymentStatus: "未收款", payoutStatus: "未付款" }).workflow,
     channelName: currentUser()?.role === "backend" ? data.channelName || "" : "",
     channelVisible: normalizedType === "直评",
     voided: false,
@@ -1667,6 +1787,7 @@ function createDispatchBatchOrders(source, draft) {
     status: "待处理",
     paymentStatus: "未收款",
     payoutStatus: "未付款",
+    workflow: normalizeOrderWorkflow({ paymentStatus: "未收款", payoutStatus: "未付款" }).workflow,
     voided: false,
     dispatchSheet: { ...draft, submittedAt, submittedBy: currentUser().id },
   }));
@@ -2405,24 +2526,395 @@ function expandVpRequirement(text) {
 }
 
 function renderFinance() {
-  const pending = state.orders.filter((o) => !o.voided && o.payoutStatus !== "已付款");
-  const total = pending.reduce((sum, o) => sum + Number(o.payable || 0), 0);
-  const canSeeChannel = ["admin", "backend", "finance"].includes(currentUser().role);
+  const role = currentUser().role;
+  if (role === "backend") return renderBackendWorkspace();
+  if (["finance", "admin"].includes(role)) return renderFinanceWorkspace();
   return `
     <section class="section">
-      <div class="section-head"><h2>合并付款申请雏形</h2><span class="hint">后端批量选择后系统自动计算总额</span></div>
-      <div class="metric"><span>当前待付款订单自动合计</span><strong>¥${money(total)}</strong></div>
+      <div class="section-head"><h2>财务管理</h2><span class="hint">当前角色无财务操作权限</span></div>
+      <div class="empty">前端人员请在订单汇总查看自己的订单进度；收付款确认由财务处理。</div>
+    </section>
+  `;
+}
+
+function renderBackendWorkspace() {
+  const orders = visibleOrders().filter((o) => !o.voided);
+  const waiting = orders.filter((o) => o.status === "待处理").length;
+  const handling = orders.filter((o) => !isFinanciallyComplete(o) && o.status !== "待处理").length;
+  const needCollectionProof = orders.filter((o) => o.paymentStatus !== "已收款" && !o.workflow?.customerPaymentProof).length;
+  const needPayoutRequest = orders.filter((o) => o.payoutStatus !== "已付款" && o.workflow?.payoutRequestStatus !== "待财务审核").length;
+  const rejected = orders.filter((o) => o.workflow?.payoutRequestStatus === "财务已退回" || o.paymentStatus === "收款退回").length;
+  return `
+    <section class="grid cols-3">
+      <div class="metric"><span>待接收订单</span><strong>${waiting}</strong></div>
+      <div class="metric"><span>处理中订单</span><strong>${handling}</strong></div>
+      <div class="metric"><span>待补收款截图</span><strong>${needCollectionProof}</strong></div>
+      <div class="metric"><span>待提交付款申请</span><strong>${needPayoutRequest}</strong></div>
+      <div class="metric"><span>财务退回</span><strong>${rejected}</strong></div>
+      <div class="metric"><span>可见订单</span><strong>${orders.length}</strong></div>
+    </section>
+    <section class="section workflow-section">
+      <div class="section-head">
+        <h2>后端订单处理池</h2>
+        <span class="hint">接单、标记渠道、上传客户收款截图、提交渠道付款申请</span>
+      </div>
       <div class="table-wrap">
-        <table>
-          <thead><tr><th>订单号</th><th>类型</th><th>渠道</th><th>应付款</th><th>付款状态</th></tr></thead>
-          <tbody>${pending.map((o) => `<tr><td>${o.orderNo}</td><td>${o.type}</td><td>${canSeeChannel ? o.channelName || "-" : "不可见"}</td><td>¥${money(o.payable)}</td><td>${o.payoutStatus}</td></tr>`).join("")}</tbody>
+        <table class="workflow-table">
+          <thead>
+            <tr><th>订单</th><th>客户/项目</th><th>渠道与收款方</th><th>金额</th><th>客户收款截图</th><th>渠道付款申请</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody>${orders.length ? orders.map(renderBackendOrderRow).join("") : `<tr><td colspan="8" class="empty">暂无分配给你的订单</td></tr>`}</tbody>
         </table>
       </div>
     </section>
   `;
 }
 
-function bindFinance() {}
+function renderBackendOrderRow(order) {
+  const workflow = order.workflow || {};
+  const customer = state.customers.find((c) => c.id === order.customerId);
+  return `
+    <tr>
+      <td><strong>${order.orderNo}</strong><br><span class="hint">${orderTypeLabel(order.type)} / ${submittedAtText(order)}</span></td>
+      <td>${customer?.name || "未知客户"}<br><span class="hint">${projectSummaryText(order)}</span></td>
+      <td>
+        <input class="cell-input" data-backend-field="${order.id}:channelName" value="${escapeAttr(order.channelName || "")}" placeholder="实际渠道名称" />
+        <input class="cell-input mt-8" data-backend-workflow="${order.id}:payeeName" value="${escapeAttr(workflow.payeeName || "")}" placeholder="收款方名称" />
+        <input class="cell-input mt-8" data-backend-workflow="${order.id}:payeeAccount" value="${escapeAttr(workflow.payeeAccount || "")}" placeholder="收款账户" />
+        <select class="cell-select mt-8" data-backend-workflow="${order.id}:payeeMethod">
+          ${["微信", "支付宝", "银行卡", "PayPal", "其他"].map((item) => `<option ${workflow.payeeMethod === item ? "selected" : ""}>${item}</option>`).join("")}
+        </select>
+      </td>
+      <td>
+        <label class="mini-label">应收</label>
+        <input class="cell-input small" type="number" step="0.01" data-backend-field="${order.id}:receivable" value="${escapeAttr(order.receivable || 0)}" />
+        <label class="mini-label">应付</label>
+        <input class="cell-input small" type="number" step="0.01" data-backend-field="${order.id}:payable" value="${escapeAttr(order.payable || 0)}" />
+      </td>
+      <td>
+        ${proofBadge(workflow.customerPaymentProof)}
+        <input class="image-input mt-8" type="file" accept="image/*" data-backend-customer-proof="${order.id}" />
+        <div class="hint">${workflow.customerPaymentSubmittedAt ? `提交：${shortDateTime(workflow.customerPaymentSubmittedAt)}` : "上传后进入待财务确认"}</div>
+      </td>
+      <td>
+        ${proofBadge(workflow.channelPaymentProof)}
+        <input class="image-input mt-8" type="file" accept="image/*" data-backend-channel-proof="${order.id}" />
+        <div class="hint">${workflow.payoutRequestSubmittedAt ? `提交：${shortDateTime(workflow.payoutRequestSubmittedAt)}` : "需先上传渠道收款/付款凭证"}</div>
+      </td>
+      <td>
+        ${statusBadge(order.paymentStatus)}
+        ${statusBadge(order.payoutStatus)}
+        ${workflow.financeRejectReason ? `<div class="reject-note">退回：${escapeHtml(workflow.financeRejectReason)}</div>` : ""}
+        ${workflow.collectionRejectReason ? `<div class="reject-note">收款退回：${escapeHtml(workflow.collectionRejectReason)}</div>` : ""}
+      </td>
+      <td>
+        <div class="action-stack">
+          <button class="btn ghost" data-backend-accept="${order.id}">接收处理</button>
+          <button class="btn ghost" data-backend-handled="${order.id}">处理完成</button>
+          <button class="btn primary" data-backend-submit-payout="${order.id}">提交付款申请</button>
+          <button class="btn warn" data-backend-remind="${order.id}">催前端收款</button>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function renderFinanceWorkspace() {
+  const orders = state.orders.filter((o) => !o.voided);
+  const pendingCollection = orders.filter((o) => o.paymentStatus === "待财务确认" || (o.workflow?.customerPaymentProof && o.paymentStatus !== "已收款"));
+  const pendingPayout = orders.filter((o) => o.workflow?.payoutRequestStatus === "待财务审核" || o.payoutStatus === "待财务审核");
+  const todayCollections = orders.filter((o) => String(o.workflow?.financeCollectionConfirmedAt || "").slice(0, 10) === today()).length;
+  const todayPayouts = orders.filter((o) => String(o.workflow?.financePayoutConfirmedAt || "").slice(0, 10) === today()).length;
+  const openLoop = orders.filter((o) => !isFinanciallyComplete(o)).length;
+  return `
+    <section class="grid cols-3">
+      <div class="metric"><span>待确认收款</span><strong>${pendingCollection.length}</strong></div>
+      <div class="metric"><span>待审核付款</span><strong>${pendingPayout.length}</strong></div>
+      <div class="metric"><span>未闭环订单</span><strong>${openLoop}</strong></div>
+      <div class="metric"><span>今日确认收款</span><strong>${todayCollections}</strong></div>
+      <div class="metric"><span>今日已付款</span><strong>${todayPayouts}</strong></div>
+      <div class="metric"><span>待付合计</span><strong>¥${money(pendingPayout.reduce((sum, o) => sum + Number(o.payable || 0), 0))}</strong></div>
+    </section>
+    <section class="section workflow-section">
+      <div class="section-head"><h2>收款核对</h2><span class="hint">客户付款截图只代表待确认，财务确认金额后才算已收款</span></div>
+      <div class="table-wrap">
+        <table class="workflow-table">
+          <thead><tr><th>订单</th><th>客户/接单人</th><th>客户付款截图</th><th>应收/实收</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${pendingCollection.length ? pendingCollection.map(renderCollectionAuditRow).join("") : `<tr><td colspan="6" class="empty">暂无待确认收款</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section workflow-section">
+      <div class="section-head"><h2>付款审核</h2><span class="hint">核对后端渠道凭证和账户，付款后上传付款截图并确认</span></div>
+      <div class="table-wrap">
+        <table class="workflow-table">
+          <thead><tr><th>订单</th><th>渠道/收款方</th><th>后端凭证</th><th>应付/实付</th><th>财务付款截图</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${pendingPayout.length ? pendingPayout.map(renderPayoutAuditRow).join("") : `<tr><td colspan="7" class="empty">暂无待审核付款</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderCollectionAuditRow(order) {
+  const workflow = order.workflow || {};
+  const customer = state.customers.find((c) => c.id === order.customerId);
+  return `
+    <tr>
+      <td><strong>${order.orderNo}</strong><br><span class="hint">${orderTypeLabel(order.type)} / ${projectSummaryText(order)}</span></td>
+      <td>${customer?.name || "未知客户"}<br><span class="hint">接单：${userName(order.frontendId)}</span></td>
+      <td>${proofBadge(workflow.customerPaymentProof)}<br><span class="hint">${workflow.customerPaymentSubmittedAt ? shortDateTime(workflow.customerPaymentSubmittedAt) : "未记录提交时间"}</span></td>
+      <td>
+        <div>应收 ¥${money(order.receivable || 0)}</div>
+        <input class="cell-input small mt-8" type="number" step="0.01" data-finance-field="${order.id}:received" value="${escapeAttr(order.received || order.receivable || 0)}" />
+      </td>
+      <td>${statusBadge(order.paymentStatus)}${workflow.collectionRejectReason ? `<div class="reject-note">${escapeHtml(workflow.collectionRejectReason)}</div>` : ""}</td>
+      <td>
+        <div class="action-stack">
+          <button class="btn primary" data-finance-confirm-collection="${order.id}">确认收款</button>
+          <button class="btn warn" data-finance-reject-collection="${order.id}">退回收款</button>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function renderPayoutAuditRow(order) {
+  const workflow = order.workflow || {};
+  return `
+    <tr>
+      <td><strong>${order.orderNo}</strong><br><span class="hint">${orderTypeLabel(order.type)} / ${projectSummaryText(order)}</span></td>
+      <td>
+        ${order.channelName || "-"}<br>
+        <span class="hint">${workflow.payeeName || "未填收款方"} / ${workflow.payeeMethod || "-"}<br>${workflow.payeeAccount || ""}</span>
+      </td>
+      <td>${proofBadge(workflow.channelPaymentProof)}<br><span class="hint">${workflow.payoutRequestSubmittedAt ? shortDateTime(workflow.payoutRequestSubmittedAt) : "未提交"}</span></td>
+      <td>
+        <div>应付 ¥${money(order.payable || 0)}</div>
+        <input class="cell-input small mt-8" type="number" step="0.01" data-finance-field="${order.id}:paid" value="${escapeAttr(order.paid || order.payable || 0)}" />
+      </td>
+      <td>
+        ${proofBadge(workflow.financePayoutProof)}
+        <input class="image-input mt-8" type="file" accept="image/*" data-finance-payout-proof="${order.id}" />
+      </td>
+      <td>
+        ${statusBadge(workflow.payoutRequestStatus)}
+        ${workflow.financeRejectReason ? `<div class="reject-note">${escapeHtml(workflow.financeRejectReason)}</div>` : ""}
+      </td>
+      <td>
+        <div class="action-stack">
+          <button class="btn primary" data-finance-confirm-payout="${order.id}">确认付款</button>
+          <button class="btn warn" data-finance-reject-payout="${order.id}">退回付款</button>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function proofBadge(value) {
+  return value ? `<span class="tag green">已上传</span>` : `<span class="tag red">未上传</span>`;
+}
+
+function statusBadge(value) {
+  const text = value || "未处理";
+  const color = text.includes("已收") || text.includes("已付") || text.includes("完成") ? "green" : text.includes("退回") ? "red" : "amber";
+  return `<span class="tag ${color}">${text}</span>`;
+}
+
+function userName(userId) {
+  return users.find((u) => u.id === userId)?.name || "-";
+}
+
+function shortDateTime(value) {
+  if (!value) return "";
+  return new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function bindFinance() {
+  document.querySelectorAll("[data-backend-field]").forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const [orderId, field] = event.currentTarget.dataset.backendField.split(":");
+      const order = state.orders.find((o) => o.id === orderId);
+      if (!order) return;
+      order[field] = event.currentTarget.type === "number" ? Number(event.currentTarget.value || 0) : event.currentTarget.value;
+      log("后端更新订单", `${order.orderNo} / ${field}`);
+      saveState();
+    });
+  });
+  document.querySelectorAll("[data-backend-workflow]").forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const [orderId, field] = event.currentTarget.dataset.backendWorkflow.split(":");
+      const order = state.orders.find((o) => o.id === orderId);
+      if (!order) return;
+      order.workflow ||= {};
+      order.workflow[field] = event.currentTarget.value;
+      log("后端更新付款信息", `${order.orderNo} / ${field}`);
+      saveState();
+    });
+  });
+  document.querySelectorAll("[data-backend-customer-proof]").forEach((input) => {
+    input.addEventListener("change", async (event) => {
+      const order = state.orders.find((o) => o.id === event.currentTarget.dataset.backendCustomerProof);
+      const file = event.currentTarget.files?.[0];
+      if (!order || !file) return;
+      submitCustomerPaymentProof(order, await readFileAsDataUrl(file));
+      log("提交客户收款截图", order.orderNo);
+      saveState();
+      toast("收款截图已提交财务确认");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-backend-channel-proof]").forEach((input) => {
+    input.addEventListener("change", async (event) => {
+      const order = state.orders.find((o) => o.id === event.currentTarget.dataset.backendChannelProof);
+      const file = event.currentTarget.files?.[0];
+      if (!order || !file) return;
+      order.workflow ||= {};
+      order.workflow.channelPaymentProof = await readFileAsDataUrl(file);
+      log("上传渠道付款凭证", order.orderNo);
+      saveState();
+      toast("渠道凭证已上传");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-backend-accept]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.backendAccept);
+      if (!order) return;
+      markBackendAccepted(order);
+      log("后端接收订单", order.orderNo);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-backend-handled]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.backendHandled);
+      if (!order) return;
+      markBackendHandled(order);
+      log("后端处理完成", order.orderNo);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-backend-submit-payout]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.backendSubmitPayout);
+      if (!order) return;
+      if (!order.channelName) {
+        toast("请先填写实际渠道名称");
+        return;
+      }
+      if (!order.workflow?.channelPaymentProof) {
+        toast("请先上传渠道收款或付款凭证");
+        return;
+      }
+      submitPayoutRequest(order);
+      log("提交付款申请", `${order.orderNo} / ¥${money(order.payable)}`);
+      saveState();
+      toast("付款申请已提交财务");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-backend-remind]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.backendRemind);
+      if (!order) return;
+      order.workflow ||= {};
+      order.workflow.collectionReminderAt = nowIso();
+      log("催款提醒", `${order.orderNo} 提醒 ${userName(order.frontendId)} 跟进收款`);
+      saveState();
+      toast("已记录催款提醒");
+    });
+  });
+  document.querySelectorAll("[data-finance-field]").forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const [orderId, field] = event.currentTarget.dataset.financeField.split(":");
+      const order = state.orders.find((o) => o.id === orderId);
+      if (!order) return;
+      order[field] = Number(event.currentTarget.value || 0);
+      saveState();
+    });
+  });
+  document.querySelectorAll("[data-finance-payout-proof]").forEach((input) => {
+    input.addEventListener("change", async (event) => {
+      const order = state.orders.find((o) => o.id === event.currentTarget.dataset.financePayoutProof);
+      const file = event.currentTarget.files?.[0];
+      if (!order || !file) return;
+      order.workflow ||= {};
+      order.workflow.financePayoutProof = await readFileAsDataUrl(file);
+      log("上传财务付款截图", order.orderNo);
+      saveState();
+      toast("财务付款截图已上传");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-finance-confirm-collection]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.financeConfirmCollection);
+      if (!order) return;
+      if (!order.workflow?.customerPaymentProof) {
+        toast("缺少客户收款截图，不能确认收款");
+        return;
+      }
+      const inputAmount = document.querySelector(`[data-finance-field="${order.id}:received"]`)?.value;
+      confirmCollection(order, inputAmount || order.received || order.receivable);
+      log("财务确认收款", `${order.orderNo} / ¥${money(order.received)}`);
+      saveState();
+      toast("收款已确认");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-finance-reject-collection]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.financeRejectCollection);
+      if (!order) return;
+      const reason = prompt("请输入退回原因", order.workflow?.collectionRejectReason || "收款截图或金额异常");
+      if (reason === null) return;
+      rejectCollection(order, reason);
+      log("财务退回收款", `${order.orderNo} / ${reason}`);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-finance-confirm-payout]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.financeConfirmPayout);
+      if (!order) return;
+      if (!order.workflow?.financePayoutProof) {
+        toast("请先上传财务付款截图");
+        return;
+      }
+      const inputAmount = document.querySelector(`[data-finance-field="${order.id}:paid"]`)?.value;
+      confirmPayout(order, inputAmount || order.paid || order.payable);
+      log("财务确认付款", `${order.orderNo} / ¥${money(order.paid)}`);
+      saveState();
+      toast("付款已确认");
+      render();
+    });
+  });
+  document.querySelectorAll("[data-finance-reject-payout]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const order = state.orders.find((o) => o.id === btn.dataset.financeRejectPayout);
+      if (!order) return;
+      const reason = prompt("请输入退回原因", order.workflow?.financeRejectReason || "渠道截图、账户或金额异常");
+      if (reason === null) return;
+      rejectPayout(order, reason);
+      log("财务退回付款", `${order.orderNo} / ${reason}`);
+      saveState();
+      render();
+    });
+  });
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 function renderPricing() {
   const isAdmin = currentUser().role === "admin";
