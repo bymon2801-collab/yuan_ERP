@@ -250,6 +250,7 @@ function loadState() {
     dispatchBuilder: null,
     dispatchDraft: null,
     pendingVoidOrderId: "",
+    activeOrderDetailId: "",
     pricing: {
       direct: [
         { site: "US", warranty7: 40, warranty30: 80 },
@@ -278,6 +279,7 @@ state.orderSummary.expandedBatchIds ||= {};
 state.dispatchBuilder ||= null;
 state.dispatchDraft ||= null;
 state.pendingVoidOrderId ||= "";
+state.activeOrderDetailId ||= "";
 state = normalizeState(state);
 
 function saveState(next = state) {
@@ -401,6 +403,7 @@ function render() {
       </main>
       ${renderVoidConfirmModal()}
       ${renderDispatchBuilderModal()}
+      ${renderOrderDetailModal()}
     </div>
   `;
   bindShell();
@@ -473,6 +476,7 @@ function normalizeState(next) {
   next.dispatchBuilder ||= null;
   next.dispatchDraft = normalizeDispatchDraft(next.dispatchDraft);
   next.pendingVoidOrderId ||= "";
+  next.activeOrderDetailId ||= "";
   next.pricing ||= {};
   next.pricing.direct ||= [];
   next.pricing.vpCommissions ||= {};
@@ -487,8 +491,11 @@ function normalizeState(next) {
 function normalizeOrderWorkflow(order) {
   const next = { ...order };
   next.workflow ||= {};
+  next.attachments ||= [];
   next.workflow.backendAcceptedAt ||= "";
   next.workflow.backendCompletedAt ||= "";
+  next.workflow.backendDispatchedAt ||= next.workflow.backendAcceptedAt || "";
+  next.workflow.backendOrderedAt ||= next.workflow.backendCompletedAt || "";
   next.workflow.customerPaymentProof ||= next.customerPaymentProof || "";
   next.workflow.customerPaymentSubmittedAt ||= next.customerPaymentSubmittedAt || "";
   next.workflow.customerPaymentSubmittedBy ||= next.customerPaymentSubmittedBy || "";
@@ -518,6 +525,36 @@ function normalizeOrderWorkflow(order) {
   return next;
 }
 
+function addOrderAttachment(order, type, dataUrl, title) {
+  order.attachments ||= [];
+  const existing = order.attachments.find((item) => item.type === type);
+  const payload = {
+    id: existing?.id || uid("att"),
+    type,
+    title: title || attachmentTypeLabel(type),
+    url: dataUrl,
+    uploadedAt: nowIso(),
+    uploadedBy: currentUser()?.id || "",
+  };
+  if (existing) {
+    Object.assign(existing, payload);
+  } else {
+    order.attachments.push(payload);
+  }
+  return payload;
+}
+
+function attachmentTypeLabel(type) {
+  const labels = {
+    customerPayment: "客户收款截图",
+    channelPayment: "渠道收款/付款凭证",
+    financePayout: "财务付款截图",
+    productImage: "产品图片",
+    reviewImage: "评价图",
+  };
+  return labels[type] || "附件";
+}
+
 function refreshOrderCompletion(order) {
   order.performance = Number(order.received || 0) - Number(order.paid || 0);
   if (!isFinanciallyComplete(order)) {
@@ -533,15 +570,17 @@ function refreshOrderCompletion(order) {
 
 function markBackendAccepted(order) {
   order.workflow ||= {};
-  order.status = "处理中";
+  order.status = "已排单";
   order.workflow.backendAcceptedAt ||= nowIso();
+  order.workflow.backendDispatchedAt ||= order.workflow.backendAcceptedAt;
   return order;
 }
 
 function markBackendHandled(order) {
   order.workflow ||= {};
-  order.status = order.paymentStatus === "已收款" ? "待付款申请" : "待收款确认";
+  order.status = order.paymentStatus === "已收款" ? "已出单待付款" : "已出单待收款";
   order.workflow.backendCompletedAt = nowIso();
+  order.workflow.backendOrderedAt = order.workflow.backendCompletedAt;
   return order;
 }
 
@@ -699,6 +738,151 @@ function renderDispatchBuilderModal() {
   `;
 }
 
+function renderOrderDetailModal() {
+  if (!state.activeOrderDetailId) return "";
+  const order = findOrderForDetail(state.activeOrderDetailId);
+  if (!order) return "";
+  const customer = state.customers.find((c) => c.id === order.customerId);
+  const workflow = order.workflow || {};
+  const batchOrders = order.batchOrders || [order];
+  return `
+    <div class="modal-backdrop">
+      <div class="modal detail-modal" role="dialog" aria-modal="true">
+        <div class="detail-head">
+          <div>
+            <h2>${order.orderNo}</h2>
+            <div class="hint">${orderTypeLabel(order.type)} / ${customer?.name || "未知客户"} / ${projectSummaryText(order)}</div>
+          </div>
+          <button class="icon-btn" id="closeOrderDetail" title="关闭">×</button>
+        </div>
+        <div class="detail-grid">
+          <section class="detail-panel">
+            <h3>基础信息</h3>
+            ${detailLine("客户", customer?.name || "-")}
+            ${detailLine("接单人", userName(order.frontendId))}
+            ${detailLine("对接后端", userName(order.backendId))}
+            ${detailLine("提交时间", fullDateTimeText(submittedAtOf(order)))}
+            ${detailLine("完成时间", completedDateOf(order) || "-")}
+            ${detailLine("平台/站点", `${order.platform || "-"} / ${order.site || "-"}`)}
+            ${detailLine("产品/ASIN", `${order.productName || "-"} / ${order.asin || "-"}`)}
+            ${detailLine("需求", order.requirement || order.requirementRemark || order.remark || "-")}
+            ${orderTypeLabel(order.type) === "VP真人" ? detailLine("关键词", order.keyword || "-") : ""}
+            ${orderTypeLabel(order.type) === "VP真人" ? detailLine("店铺名", order.store || "-") : ""}
+            ${orderTypeLabel(order.type) === "VP真人" ? detailLine("客户订单需求", projectSummaryText(order)) : ""}
+          </section>
+          <section class="detail-panel">
+            <h3>处理流程</h3>
+            ${detailStep("后端排单", workflow.backendDispatchedAt || workflow.backendAcceptedAt, Boolean(workflow.backendDispatchedAt || workflow.backendAcceptedAt))}
+            ${detailStep("后端已出单", workflow.backendOrderedAt || workflow.backendCompletedAt, Boolean(workflow.backendOrderedAt || workflow.backendCompletedAt))}
+            ${detailStep("财务确认收款", workflow.financeCollectionConfirmedAt, order.paymentStatus === "已收款")}
+            ${detailStep("提交付款", workflow.payoutRequestSubmittedAt, workflow.payoutRequestStatus === "待财务审核" || workflow.payoutRequestStatus === "已付款")}
+            ${detailStep("财务确认付款", workflow.financePayoutConfirmedAt, order.payoutStatus === "已付款")}
+          </section>
+          <section class="detail-panel">
+            <h3>财务凭证</h3>
+            ${detailLine("应收/实收", `¥${money(order.receivable || 0)} / ¥${money(order.received || 0)}`)}
+            ${detailLine("应付/实付", `¥${money(order.payable || 0)} / ¥${money(order.paid || 0)}`)}
+            ${detailLine("业绩", performanceText(order) || "未完成")}
+            ${detailLine("收款状态", order.paymentStatus || "-")}
+            ${detailLine("付款状态", order.payoutStatus || "-")}
+            ${detailLine("付款申请", workflow.payoutRequestStatus || "-")}
+            ${workflow.collectionRejectReason ? `<div class="reject-note wide">收款退回：${escapeHtml(workflow.collectionRejectReason)}</div>` : ""}
+            ${workflow.financeRejectReason ? `<div class="reject-note wide">付款退回：${escapeHtml(workflow.financeRejectReason)}</div>` : ""}
+          </section>
+          <section class="detail-panel">
+            <h3>渠道与收款方</h3>
+            ${detailLine("实际渠道", order.channelName || "-")}
+            ${detailLine("收款方", workflow.payeeName || "-")}
+            ${detailLine("收款方式", workflow.payeeMethod || "-")}
+            ${detailLine("收款账户", workflow.payeeAccount || "-")}
+          </section>
+        </div>
+        <section class="detail-panel detail-full">
+          <h3>附件凭证</h3>
+          ${renderAttachmentGallery(order)}
+        </section>
+        ${
+          batchOrders.length > 1
+            ? `<section class="detail-panel detail-full">
+                <h3>同批订单明细</h3>
+                <div class="table-wrap detail-table-wrap">
+                  <table class="compact-table">
+                    <thead><tr><th>订单号</th><th>项目</th><th>收付款</th><th>状态</th><th>完成时间</th></tr></thead>
+                    <tbody>${batchOrders.map((item) => `<tr><td>${item.orderNo}</td><td>${projectSummaryText(item)}</td><td>收 ¥${money(item.received)}<br><span class="hint">付 ¥${money(item.paid)}</span></td><td>${statusBadge(orderStatusText(item))}</td><td>${completedDateOf(item) || "-"}</td></tr>`).join("")}</tbody>
+                  </table>
+                </div>
+              </section>`
+            : ""
+        }
+        <section class="detail-panel detail-full">
+          <h3>订单操作记录</h3>
+          ${renderOrderTimeline(order)}
+        </section>
+      </div>
+    </div>
+  `;
+}
+
+function findOrderForDetail(id) {
+  if (String(id || "").startsWith("batch:")) {
+    const batchId = String(id).slice(6);
+    return mergeBatchOrders(state.orders).find((order) => order.batchId === batchId);
+  }
+  const direct = state.orders.find((order) => order.id === id);
+  if (direct) return direct;
+  return mergeBatchOrders(state.orders).find((order) => batchKeyOf(order) === id || order.id === id);
+}
+
+function detailLine(label, value) {
+  return `<div class="detail-line"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function detailStep(label, at, done) {
+  return `
+    <div class="detail-step ${done ? "done" : ""}">
+      <span></span>
+      <div><strong>${label}</strong><em>${at ? shortDateTime(at) : "待处理"}</em></div>
+    </div>
+  `;
+}
+
+function renderAttachmentGallery(order) {
+  const workflow = order.workflow || {};
+  const derived = [
+    workflow.customerPaymentProof ? { type: "customerPayment", title: "客户收款截图", url: workflow.customerPaymentProof, uploadedAt: workflow.customerPaymentSubmittedAt, uploadedBy: workflow.customerPaymentSubmittedBy } : null,
+    workflow.channelPaymentProof ? { type: "channelPayment", title: "渠道收款/付款凭证", url: workflow.channelPaymentProof, uploadedAt: workflow.payoutRequestSubmittedAt, uploadedBy: workflow.payoutRequestSubmittedBy } : null,
+    workflow.financePayoutProof ? { type: "financePayout", title: "财务付款截图", url: workflow.financePayoutProof, uploadedAt: workflow.financePayoutConfirmedAt, uploadedBy: workflow.financePayoutConfirmedBy } : null,
+    order.productImage ? { type: "productImage", title: "产品图片", url: order.productImage, uploadedAt: submittedAtOf(order), uploadedBy: order.frontendId } : null,
+    order.reviewImage ? { type: "reviewImage", title: "评价图", url: order.reviewImage, uploadedAt: submittedAtOf(order), uploadedBy: order.frontendId } : null,
+    ...(order.attachments || []),
+  ].filter(Boolean);
+  const unique = [];
+  derived.forEach((item) => {
+    if (!item.url || unique.some((existing) => existing.type === item.type && existing.url === item.url)) return;
+    unique.push(item);
+  });
+  if (!unique.length) return `<div class="empty compact-empty">暂无附件凭证</div>`;
+  return `<div class="attachment-grid">${unique.map(renderAttachmentCard).join("")}</div>`;
+}
+
+function renderAttachmentCard(item) {
+  const isImage = /^data:image|\.(png|jpe?g|gif|webp)$/i.test(String(item.url || ""));
+  return `
+    <div class="attachment-card">
+      ${isImage ? `<img src="${item.url}" alt="${escapeAttr(item.title || "附件")}" />` : `<div class="attachment-file">文件</div>`}
+      <strong>${escapeHtml(item.title || attachmentTypeLabel(item.type))}</strong>
+      <span>${item.uploadedAt ? shortDateTime(item.uploadedAt) : "未记录时间"} / ${userName(item.uploadedBy)}</span>
+    </div>
+  `;
+}
+
+function renderOrderTimeline(order) {
+  const orderNos = (order.batchOrders || [order]).map((item) => item.orderNo).filter(Boolean);
+  const related = state.logs.filter((item) => orderNos.some((orderNo) => String(item.detail || "").includes(orderNo))).slice(0, 12);
+  if (!related.length) return `<div class="empty compact-empty">暂无针对该订单的操作日志</div>`;
+  return `<div class="timeline-list">${related.map((item) => `<div><span>${item.at}</span><strong>${item.action}</strong><em>${escapeHtml(item.detail)}</em></div>`).join("")}</div>`;
+}
+
 function bindShell() {
   document.querySelectorAll("[data-nav]").forEach((btn) => {
     btn.addEventListener("click", () => setPage(btn.dataset.nav));
@@ -729,6 +913,11 @@ function bindShell() {
     log("订单作废", `${o.orderNo}，恢复需后端处理`);
     saveState();
     toast("订单已作废，恢复需后端处理");
+    render();
+  });
+  document.querySelector("#closeOrderDetail")?.addEventListener("click", () => {
+    state.activeOrderDetailId = "";
+    saveState();
     render();
   });
   document.querySelector("#cancelDispatchBuilder")?.addEventListener("click", () => {
@@ -1069,7 +1258,6 @@ function renderOrders() {
         <button class="btn ghost toolbar-right" id="toggleVoidedOrders">${state.orderSummary.showVoided ? "返回全部订单" : "作废订单列表"}</button>
       </div>
     </section>
-    ${renderDispatchDraft()}
     ${
       activeType
         ? renderExpandedOrderType(activeType, summaryOrders)
@@ -1165,8 +1353,46 @@ function projectSummaryText(order) {
 
 function projectSummaryHtml(order) {
   return projectLinesOf(order)
-    .map((line) => `${line.count}单<br><span class="hint">${line.project}</span>`)
+    .map((line) => `${line.count}单${escapeHtml(line.project)}`)
     .join("<br>");
+}
+
+function batchChildrenOf(order) {
+  return order.batchOrders || [order];
+}
+
+function directUnitReceivable(order) {
+  const explicit = Number(order.receivable || 0);
+  if (explicit > 0) return explicit;
+  const site = normalizeDirectSite(order.site || "");
+  const priceRow = state.pricing.direct.find((item) => normalizeDirectSite(item.site) === site || item.site === site);
+  const warranty = String(order.warranty || "");
+  if (!priceRow) return 0;
+  return warranty.includes("30") ? Number(priceRow.warranty30 || 0) : Number(priceRow.warranty7 || 0);
+}
+
+function pendingCollectionAmount(order) {
+  return batchChildrenOf(order)
+    .filter((child) => child.paymentStatus !== "已收款")
+    .reduce((sum, child) => sum + (Number(child.receivable || 0) || directUnitReceivable(child)), 0);
+}
+
+function batchStatusHtml(order) {
+  const children = batchChildrenOf(order);
+  if (children.length <= 1) return `<span class="tag ${order.voided ? "red" : isFinanciallyComplete(order) ? "green" : "amber"}">${orderStatusText(order)}</span>`;
+  const shown = children.filter((child) => child.status === "已显示" || child.status === "已完成" || child.paymentStatus === "已收款").length;
+  const pending = pendingCollectionAmount(order);
+  return `
+    <span class="tag ${shown === children.length ? "green" : "amber"}">已显示 ${shown}/${children.length}</span>
+    ${pending > 0 ? `<br><span class="tag amber mt-8">待结算 ¥${money(pending)}</span>` : `<br><span class="tag green mt-8">已结算</span>`}
+  `;
+}
+
+function paymentCellHtml(order) {
+  return `
+    收 ¥${money(order.received || 0)} <span class="hint">${order.paymentStatus || "未收款"}</span><br>
+    <span class="hint">付 ¥${money(order.paid || 0)} ${order.payoutStatus || "未付款"}</span>
+  `;
 }
 
 function ordersForType(orders, type) {
@@ -1181,10 +1407,8 @@ function mergeBatchOrders(orders) {
   const merged = new Map();
   orders.forEach((order) => {
     const typeLabel = orderTypeLabel(order.type);
-    const key = order.batchId
-      ? typeLabel === "直评"
-        ? [order.batchId, typeLabel, order.customerId].join("|")
-        : [order.batchId, typeLabel, order.customerId, order.asin, order.productName].join("|")
+  const key = order.batchId
+      ? [order.batchId, typeLabel, order.customerId].join("|")
       : order.id;
     if (!merged.has(key)) {
       merged.set(key, { ...order, projectLines: [...projectLinesOf(order)], batchOrders: [order] });
@@ -1266,6 +1490,7 @@ function renderOrderTypePreview(type, orders) {
           <button class="btn ghost" data-view-type="${type.label}">查看更多</button>
         </div>
       </div>
+      ${type.label === "VP真人" ? renderDispatchDraft() : ""}
       ${renderOrdersTable(rows.slice(0, 3), { compact: true, type })}
     </section>
   `;
@@ -1276,6 +1501,7 @@ function renderExpandedOrderType(type, orders) {
   return `
     <section class="section">
       <div class="section-head"><h2>${type.label}全部订单</h2><span class="hint">可通过表头筛选当前项目订单</span></div>
+      ${type.label === "VP真人" ? renderDispatchDraft() : ""}
       ${renderOrdersTable(rows, { filterType: type.label, type })}
     </section>
   `;
@@ -1347,7 +1573,7 @@ function renderOrdersTable(orders, options = {}) {
 }
 
 function batchKeyOf(order) {
-  return order.batchId || order.id;
+  return order.batchId ? `batch:${order.batchId}` : order.id;
 }
 
 function renderOrderRows(o) {
@@ -1359,8 +1585,13 @@ function renderOrderRow(o) {
   const c = state.customers.find((x) => x.id === o.customerId);
   const user = currentUser();
   const isDirect = orderTypeLabel(o.type) === "直评";
+  const isBatchSummary = batchChildrenOf(o).length > 1;
   const siteCell = isDirect ? `${o.site || "-"}` : `${o.platform || "-"}<br><span class="hint">${o.site || ""}</span>`;
-  const productCell = isDirect ? `${o.asin || "-"}` : `${o.productName || "-"}<br><span class="hint">${o.asin || ""}</span>`;
+  const productCell = isBatchSummary
+    ? `-<br><span class="hint">${isDirect ? "展开查看每条 ASIN" : "展开查看每个客户订单"}</span>`
+    : isDirect
+      ? `${o.asin || "-"}`
+      : `${o.productName || "-"}<br><span class="hint">${o.asin || ""}</span>`;
   return `
     <tr class="${o.voided ? "invalid-row" : ""}">
       <td>${submittedAtText(o)}</td>
@@ -1369,11 +1600,12 @@ function renderOrderRow(o) {
       <td>${siteCell}</td>
       <td>${productCell}</td>
       <td>${projectSummaryHtml(o)}</td>
-      <td>收 ¥${money(o.received || 0)}<br><span class="hint">付 ¥${money(o.paid || 0)}</span></td>
+      <td>${paymentCellHtml(o)}</td>
       <td>${performanceText(o)}</td>
-      <td><span class="tag ${o.voided ? "red" : isFinanciallyComplete(o) ? "green" : "amber"}">${orderStatusText(o)}</span></td>
+      <td>${batchStatusHtml(o)}</td>
       <td>
         ${o.batchOrders?.length > 1 ? `<button class="btn ghost" data-toggle-batch="${batchKeyOf(o)}">${state.orderSummary.expandedBatchIds?.[batchKeyOf(o)] ? "收起" : "展开"}</button>` : ""}
+        <button class="btn ghost" data-order-detail="${o.batchOrders?.length > 1 ? batchKeyOf(o) : o.id}">详情</button>
         ${orderTypeLabel(o.type) === "VP真人" ? `<button class="btn ghost" data-copy-vp="${o.id}">复制排单</button>` : ""}
         ${o.voided && user.role === "backend" ? `<button class="btn ghost" data-restore-order="${o.id}">恢复订单</button>` : ""}
         ${!o.voided ? `<button class="btn warn" data-void-order="${o.id}">作废</button>` : ""}
@@ -1397,10 +1629,10 @@ function renderBatchDetailRows(order) {
           <td>${siteCell}</td>
           <td>${productCell}</td>
           <td>${projectSummaryHtml(child)}</td>
-          <td>收 ¥${money(child.received || 0)}<br><span class="hint">付 ¥${money(child.paid || 0)}</span></td>
+          <td>${paymentCellHtml(child)}</td>
           <td>${performanceText(child)}</td>
-          <td><span class="tag ${child.voided ? "red" : isFinanciallyComplete(child) ? "green" : "amber"}">${orderStatusText(child)}</span></td>
-          <td></td>
+          <td><span class="tag ${child.voided ? "red" : isFinanciallyComplete(child) ? "green" : child.paymentStatus === "已收款" ? "green" : "amber"}">${orderStatusText(child)}</span><br>${statusBadge(child.paymentStatus)} ${statusBadge(child.payoutStatus)}</td>
+          <td><button class="btn ghost" data-order-detail="${child.id}">详情</button></td>
         </tr>
       `;
     })
@@ -1468,6 +1700,13 @@ function bindOrders() {
       render();
     });
   });
+  document.querySelectorAll("[data-order-detail]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.activeOrderDetailId = btn.dataset.orderDetail;
+      saveState();
+      render();
+    });
+  });
   document.querySelectorAll("[data-order-filter]").forEach((input) => {
     input.addEventListener("change", updateOrderFilter);
     input.addEventListener("keydown", (event) => {
@@ -1531,6 +1770,10 @@ function bindOrders() {
     orders.slice().reverse().forEach((order) => state.orders.unshift(order));
     log("提交排单", `${orders[0].orderNo} / ${projectTextFromRows(draft.rows) || "VP真人"}`);
     state.dispatchDraft = null;
+    state.orderSummary.expandedType = "";
+    state.orderSummary.showVoided = false;
+    state.orderSummary.expandedBatchIds ||= {};
+    state.orderSummary.expandedBatchIds[`batch:${orders[0].batchId}`] = false;
     saveState();
     render();
     copyText(dispatchSheetCopyText(draft));
@@ -2609,10 +2852,11 @@ function renderBackendOrderRow(order) {
       </td>
       <td>
         <div class="action-stack">
-          <button class="btn ghost" data-backend-accept="${order.id}">接收处理</button>
-          <button class="btn ghost" data-backend-handled="${order.id}">处理完成</button>
+          <button class="btn ghost" data-backend-accept="${order.id}">已排单</button>
+          <button class="btn ghost" data-backend-handled="${order.id}">已出单</button>
           <button class="btn primary" data-backend-submit-payout="${order.id}">提交付款申请</button>
           <button class="btn warn" data-backend-remind="${order.id}">催前端收款</button>
+          <button class="btn ghost" data-finance-order-detail="${order.id}">详情</button>
         </div>
       </td>
     </tr>
@@ -2673,6 +2917,7 @@ function renderCollectionAuditRow(order) {
         <div class="action-stack">
           <button class="btn primary" data-finance-confirm-collection="${order.id}">确认收款</button>
           <button class="btn warn" data-finance-reject-collection="${order.id}">退回收款</button>
+          <button class="btn ghost" data-finance-order-detail="${order.id}">详情</button>
         </div>
       </td>
     </tr>
@@ -2705,6 +2950,7 @@ function renderPayoutAuditRow(order) {
         <div class="action-stack">
           <button class="btn primary" data-finance-confirm-payout="${order.id}">确认付款</button>
           <button class="btn warn" data-finance-reject-payout="${order.id}">退回付款</button>
+          <button class="btn ghost" data-finance-order-detail="${order.id}">详情</button>
         </div>
       </td>
     </tr>
@@ -2757,7 +3003,9 @@ function bindFinance() {
       const order = state.orders.find((o) => o.id === event.currentTarget.dataset.backendCustomerProof);
       const file = event.currentTarget.files?.[0];
       if (!order || !file) return;
-      submitCustomerPaymentProof(order, await readFileAsDataUrl(file));
+      const dataUrl = await readFileAsDataUrl(file);
+      submitCustomerPaymentProof(order, dataUrl);
+      addOrderAttachment(order, "customerPayment", dataUrl, "客户收款截图");
       log("提交客户收款截图", order.orderNo);
       saveState();
       toast("收款截图已提交财务确认");
@@ -2769,8 +3017,10 @@ function bindFinance() {
       const order = state.orders.find((o) => o.id === event.currentTarget.dataset.backendChannelProof);
       const file = event.currentTarget.files?.[0];
       if (!order || !file) return;
+      const dataUrl = await readFileAsDataUrl(file);
       order.workflow ||= {};
-      order.workflow.channelPaymentProof = await readFileAsDataUrl(file);
+      order.workflow.channelPaymentProof = dataUrl;
+      addOrderAttachment(order, "channelPayment", dataUrl, "渠道收款/付款凭证");
       log("上传渠道付款凭证", order.orderNo);
       saveState();
       toast("渠道凭证已上传");
@@ -2841,8 +3091,10 @@ function bindFinance() {
       const order = state.orders.find((o) => o.id === event.currentTarget.dataset.financePayoutProof);
       const file = event.currentTarget.files?.[0];
       if (!order || !file) return;
+      const dataUrl = await readFileAsDataUrl(file);
       order.workflow ||= {};
-      order.workflow.financePayoutProof = await readFileAsDataUrl(file);
+      order.workflow.financePayoutProof = dataUrl;
+      addOrderAttachment(order, "financePayout", dataUrl, "财务付款截图");
       log("上传财务付款截图", order.orderNo);
       saveState();
       toast("财务付款截图已上传");
@@ -2901,6 +3153,13 @@ function bindFinance() {
       if (reason === null) return;
       rejectPayout(order, reason);
       log("财务退回付款", `${order.orderNo} / ${reason}`);
+      saveState();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-finance-order-detail]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.activeOrderDetailId = btn.dataset.financeOrderDetail;
       saveState();
       render();
     });
