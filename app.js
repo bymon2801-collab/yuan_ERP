@@ -2,11 +2,12 @@ const STORAGE_KEY = "yuan-erp-mvp-state-v1";
 let memoryState = null;
 
 const users = [
-  { id: "u-admin", name: "管理员", role: "admin", team: "管理组" },
-  { id: "u-fe-a", name: "前端小元", role: "frontend", team: "一组" },
-  { id: "u-leader", name: "组长小周", role: "leader", team: "一组" },
-  { id: "u-back", name: "后端小林", role: "backend", team: "后端组" },
-  { id: "u-fin", name: "财务小陈", role: "finance", team: "财务组" },
+  { id: "u-admin", name: "管理员", role: "admin", team: "管理组", avatar: "管", incentive: false },
+  { id: "u-fe-a", name: "前端小元", role: "frontend", team: "一组", avatar: "元", incentive: true },
+  { id: "u-leader", name: "组长小周", role: "leader", team: "一组", avatar: "周", incentive: false },
+  { id: "u-back-direct", name: "直评后端小林", role: "backend", team: "直评后端组", avatar: "直", backendScope: ["直评", "买家秀"], incentive: false },
+  { id: "u-back", name: "VP后端小赵", role: "backend", team: "VP后端组", avatar: "VP", backendScope: ["VP真人", "VINE定制"], incentive: false },
+  { id: "u-fin", name: "财务小陈", role: "finance", team: "财务组", avatar: "财", incentive: false },
 ];
 
 const roleNames = {
@@ -23,6 +24,7 @@ const navItems = [
   ["orders", "订单汇总"],
   ["import", "订单导入"],
   ["finance", "财务管理"],
+  ["accounts", "账号管理"],
   ["pricing", "业务报价"],
   ["logs", "操作日志"],
 ];
@@ -311,6 +313,11 @@ function currentUser() {
   return users.find((u) => u.id === state.currentUserId);
 }
 
+function visibleNavItems(user = currentUser()) {
+  if (!user) return navItems;
+  return navItems.filter(([key]) => key !== "accounts" || user.role === "admin");
+}
+
 function canSeeAll(user = currentUser()) {
   return user && ["admin", "finance"].includes(user.role);
 }
@@ -330,12 +337,27 @@ function visibleOrders() {
   const user = currentUser();
   if (!user) return [];
   if (["admin", "finance"].includes(user.role)) return state.orders;
-  if (user.role === "backend") return state.orders.filter((o) => o.backendId === user.id);
+  if (user.role === "backend") return state.orders.filter((o) => o.backendId === user.id || o.createdBy === user.id);
   if (user.role === "leader") {
     const ids = state.customers.filter((c) => c.team === user.team).map((c) => c.id);
     return state.orders.filter((o) => ids.includes(o.customerId));
   }
   return state.orders.filter((o) => o.frontendId === user.id);
+}
+
+function defaultBackendIdForType(type) {
+  const label = orderTypeLabel(type);
+  if (["直评", "买家秀"].includes(label)) return "u-back-direct";
+  if (["VP真人", "VINE定制"].includes(label)) return "u-back";
+  return "u-back";
+}
+
+function backendScopeText(user) {
+  return user.backendScope?.length ? user.backendScope.join("、") : "-";
+}
+
+function canCreateOrders(user = currentUser()) {
+  return user && ["frontend", "leader", "backend", "admin"].includes(user.role);
 }
 
 function log(action, detail) {
@@ -384,7 +406,7 @@ function render() {
           <span>测评板块 MVP</span>
         </div>
         <nav class="nav">
-          ${navItems.map(([key, label]) => `<button class="${state.activePage === key ? "active" : ""}" data-nav="${key}">${label}</button>`).join("")}
+          ${visibleNavItems(user).map(([key, label]) => `<button class="${state.activePage === key ? "active" : ""}" data-nav="${key}">${label}</button>`).join("")}
         </nav>
         <div class="user-strip">
           <div>${user.name}</div>
@@ -415,6 +437,18 @@ function renderLogin() {
       <section class="login-hero">
         <h1>元跨境内部 ERP</h1>
         <p>第一版先跑通测评板块的核心流程：客户归属、订单录入、后端排单、财务确认、业绩排名和批量导入预览。</p>
+        <div class="login-role-grid">
+          ${loginRoleBriefs()
+            .map(
+              (item) => `
+                <div class="login-role-card">
+                  <strong>${item.title}</strong>
+                  <span>${item.desc}</span>
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
       </section>
       <section class="login-panel">
         <form class="login-box" id="loginForm">
@@ -437,6 +471,15 @@ function renderLogin() {
   `;
 }
 
+function loginRoleBriefs() {
+  return [
+    { title: "前端", desc: "录入客户订单，参与销售激励排名" },
+    { title: "后端", desc: "按业务分工排单、出单、提交付款凭证" },
+    { title: "财务", desc: "核对客户收款，审核并完成渠道付款" },
+    { title: "管理员", desc: "全局查看、创建订单、分配账号与后端负责人" },
+  ];
+}
+
 function bindLogin() {
   document.querySelector("#loginForm").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -453,12 +496,16 @@ function bindLogin() {
 }
 
 function renderPage() {
+  if (state.activePage === "accounts" && currentUser()?.role !== "admin") {
+    state.activePage = "dashboard";
+  }
   const pages = {
     dashboard: renderDashboard,
     customers: renderCustomers,
     orders: renderOrders,
     import: renderImport,
     finance: renderFinance,
+    accounts: renderAccounts,
     pricing: renderPricing,
     logs: renderLogs,
   };
@@ -490,6 +537,15 @@ function normalizeState(next) {
 
 function normalizeOrderWorkflow(order) {
   const next = { ...order };
+  const typeLabel = orderTypeLabel(next.type);
+  if (!next.backendId || (next.backendId === "u-back" && ["直评", "买家秀"].includes(typeLabel))) {
+    next.backendId = defaultBackendIdForType(typeLabel);
+  }
+  next.createdBy ||= next.frontendId || "";
+  next.orderSource ||= users.find((user) => user.id === next.createdBy)?.role === "backend" ? "后端创建" : "前端创建";
+  next.assignmentMode ||= "系统自动分配";
+  next.assignedAt ||= next.submittedAt || "";
+  next.assignedBy ||= next.createdBy || "";
   next.workflow ||= {};
   next.attachments ||= [];
   next.workflow.backendAcceptedAt ||= "";
@@ -969,6 +1025,7 @@ function bindShell() {
     orders: bindOrders,
     import: bindImport,
     finance: bindFinance,
+    accounts: bindAccounts,
     pricing: bindPricing,
     logs: () => {},
   };
@@ -979,7 +1036,10 @@ function performanceOn(date) {
   return state.orders
     .filter((o) => !o.voided && isFinanciallyComplete(o) && o.performanceAt === date)
     .reduce((map, o) => {
-      map[o.frontendId] = (map[o.frontendId] || 0) + calculablePerformance(o);
+      const owner = users.find((user) => user.id === o.frontendId);
+      if (owner?.role === "frontend" && owner.incentive) {
+        map[o.frontendId] = (map[o.frontendId] || 0) + calculablePerformance(o);
+      }
       return map;
     }, {});
 }
@@ -988,7 +1048,7 @@ function rankingFor(date) {
   const perf = performanceOn(date);
   return Object.entries(perf)
     .map(([userId, amount]) => ({ user: users.find((u) => u.id === userId), amount }))
-    .filter((x) => x.user && x.user.role !== "admin")
+    .filter((x) => x.user && x.user.role === "frontend" && x.user.incentive)
     .sort((a, b) => b.amount - a.amount);
 }
 
@@ -1000,23 +1060,28 @@ function renderDashboard() {
   const pendingCollection = orders.filter((o) => o.paymentStatus !== "已收款").length;
   return `
     ${currentUser().role === "admin" ? renderAdminDashboardPanel() : ""}
+    ${currentUser().role === "backend" ? renderBackendDashboardPanel(orders) : ""}
+    ${currentUser().role === "finance" ? renderFinanceDashboardPanel() : ""}
     <section class="section">
-      <div class="section-head"><h2>近三天销冠</h2><span class="hint">每日业绩满 ¥2,000 后参与争夺，管理员不参与</span></div>
-      <div class="grid cols-3">
+      <div class="section-head"><h2>今日实时前三</h2><span class="hint">仅前端参与销售激励，最后更新：${new Date().toLocaleTimeString("zh-CN")}</span></div>
+      ${renderRankCards(todayRank)}
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>近三天销冠</h2><span class="hint">每日业绩满 ¥2,000 后参与争夺，历史结果显示奖励</span></div>
+      <div class="champion-grid">
         ${champs
           .map(({ date, item }) => `
-          <div class="metric">
-            <span>${date}</span>
-            <strong>${item ? item.user.name : "暂无数据"}</strong>
-            <div class="hint">${item ? `${item.user.team} / 业绩 ¥${money(item.amount)}` : "没有完成业绩"}</div>
+          <div class="champion-card">
+            ${renderAvatar(item?.user)}
+            <div>
+              <span>${date}</span>
+              <strong>${item ? item.user.name : "暂无达标"}</strong>
+              <div class="hint">${item ? `${item.user.team} / 业绩 ¥${money(item.amount)} / 奖励 ¥100` : "没有前端业绩达标"}</div>
+            </div>
           </div>
         `)
           .join("")}
       </div>
-    </section>
-    <section class="section">
-      <div class="section-head"><h2>当天实时业绩排名</h2><span class="hint">固定展示前三名，最后更新：${new Date().toLocaleTimeString("zh-CN")}</span></div>
-      ${renderRankTable(todayRank)}
     </section>
     <section class="grid cols-3">
       <div class="metric"><span>可见订单数</span><strong>${orders.length}</strong></div>
@@ -1031,13 +1096,41 @@ function renderDashboard() {
 
 function dashboardRankRows(date) {
   const ranked = rankingFor(date);
-  const staff = users.filter((user) => user.role !== "admin");
+  const staff = users.filter((user) => user.role === "frontend" && user.incentive);
   const rows = [...ranked];
   staff.forEach((user) => {
     if (!rows.some((row) => row.user.id === user.id)) rows.push({ user, amount: 0 });
   });
   while (rows.length < 3) rows.push({ user: { name: "暂无员工", team: "-" }, amount: 0, empty: true });
   return rows.slice(0, 3);
+}
+
+function renderRankCards(items) {
+  return `
+    <div class="rank-card-grid">
+      ${items
+        .map(
+          (row, index) => `
+            <div class="rank-card rank-${index + 1}">
+              <div class="rank-number">${index + 1}</div>
+              ${renderAvatar(row.user)}
+              <div class="rank-body">
+                <strong>${row.user.name}</strong>
+                <span>${row.user.team}</span>
+              </div>
+              <div class="rank-amount">¥${money(row.amount)}</div>
+              ${row.amount >= 2000 ? `<span class="tag green">明日奖励已入围</span>` : ""}
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderAvatar(user) {
+  const text = user?.avatar || user?.name?.slice(0, 1) || "-";
+  return `<div class="avatar">${escapeHtml(text)}</div>`;
 }
 
 function monthKey(date = today()) {
@@ -1111,6 +1204,54 @@ function renderAdminDashboardPanel() {
   `;
 }
 
+function renderBackendDashboardPanel(orders) {
+  const user = currentUser();
+  const assignedOrders = state.orders.filter((order) => !order.voided && order.backendId === user.id);
+  const scope = backendScopeText(user);
+  const pendingDispatch = assignedOrders.filter((order) => order.status === "待后端排单" || order.status === "待处理").length;
+  const dispatched = assignedOrders.filter((order) => order.status === "已排单").length;
+  const ordered = assignedOrders.filter((order) => String(order.status || "").includes("已出单")).length;
+  const rejected = assignedOrders.filter((order) => order.workflow?.payoutRequestStatus === "财务已退回" || order.paymentStatus === "收款退回").length;
+  return `
+    <section class="section">
+      <div class="section-head"><h2>后端处理工作台</h2><span class="hint">负责业务：${scope}</span></div>
+      <div class="grid cols-3">
+        <div class="metric"><span>待排单</span><strong>${pendingDispatch}</strong></div>
+        <div class="metric"><span>已排单待出单</span><strong>${dispatched}</strong></div>
+        <div class="metric"><span>已出单推进中</span><strong>${ordered}</strong></div>
+        <div class="metric"><span>财务退回</span><strong>${rejected}</strong></div>
+        <div class="metric"><span>我的处理订单</span><strong>${assignedOrders.length}</strong></div>
+        <div class="metric"><span>后端创建入口</span><strong>订单导入</strong></div>
+      </div>
+    </section>
+  `;
+}
+
+function renderFinanceDashboardPanel() {
+  const orders = state.orders.filter((order) => !order.voided);
+  const pendingCollection = orders.filter((order) => order.paymentStatus === "待财务确认" || (order.workflow?.customerPaymentProof && order.paymentStatus !== "已收款")).length;
+  const pendingPayout = orders.filter((order) => order.workflow?.payoutRequestStatus === "待财务审核" || order.payoutStatus === "待财务审核").length;
+  const todayReceived = orders
+    .filter((order) => String(order.workflow?.financeCollectionConfirmedAt || "").slice(0, 10) === today())
+    .reduce((sum, order) => sum + Number(order.received || 0), 0);
+  const todayPaid = orders
+    .filter((order) => String(order.workflow?.financePayoutConfirmedAt || "").slice(0, 10) === today())
+    .reduce((sum, order) => sum + Number(order.paid || 0), 0);
+  return `
+    <section class="section">
+      <div class="section-head"><h2>财务审核台</h2><span class="hint">财务只确认收付款，不负责业务排单</span></div>
+      <div class="grid cols-3">
+        <div class="metric"><span>待确认收款</span><strong>${pendingCollection}</strong></div>
+        <div class="metric"><span>待审核付款</span><strong>${pendingPayout}</strong></div>
+        <div class="metric"><span>今日确认收款</span><strong>¥${money(todayReceived)}</strong></div>
+        <div class="metric"><span>今日确认付款</span><strong>¥${money(todayPaid)}</strong></div>
+        <div class="metric"><span>今日确认利润</span><strong>¥${money(todayReceived - todayPaid)}</strong></div>
+        <div class="metric"><span>未闭环订单</span><strong>${orders.filter((order) => !isFinanciallyComplete(order)).length}</strong></div>
+      </div>
+    </section>
+  `;
+}
+
 function renderAdminKpiRow(label, value) {
   return `<div class="admin-kpi-row"><span>${label}：</span><strong>${value}</strong></div>`;
 }
@@ -1162,6 +1303,7 @@ function renderCustomers() {
         <div class="field"><label>店铺</label><input name="store" required /></div>
         <div class="field"><label>站点</label><input name="site" value="美国" /></div>
         <div class="field"><label>状态</label><select name="status"><option>新客户</option><option>已成交</option><option>长期合作</option><option>暂停合作</option></select></div>
+        ${user.role === "admin" ? `<div class="field"><label>客户归属</label><select name="ownerId">${users.filter((u) => ["frontend", "backend", "admin"].includes(u.role)).map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
         <div class="field span-2"><label>备注</label><input name="remark" /></div>
         <button class="btn primary span-4" type="submit">确认无误并提交客户</button>
       </form>
@@ -1220,8 +1362,8 @@ function bindCustomers() {
       id: uid("c"),
       customerNo: `CUS${today().replaceAll("-", "")}${String(state.customers.length + 1).padStart(4, "0")}`,
       ...data,
-      ownerId: user.role === "frontend" ? user.id : "u-fe-a",
-      team: user.team || "一组",
+      ownerId: user.role === "admin" ? data.ownerId || user.id : user.id,
+      team: user.role === "admin" ? users.find((item) => item.id === data.ownerId)?.team || user.team : user.team || "一组",
       contactConfirmed: true,
       createdAt: today(),
       totalDealAmount: 0,
@@ -1874,6 +2016,9 @@ function createOrderFromData(data, userId, meta = {}) {
   const type = data.type || "直评";
   const typeMeta = orderTypes.find((item) => item.label === type || item.legacy === type) || orderTypes[0];
   const normalizedType = typeMeta.label;
+  const creator = users.find((user) => user.id === userId) || currentUser();
+  const ownerId = data.frontendId || (creator?.role === "admin" ? userId : userId);
+  const assignedBackendId = data.backendId || defaultBackendIdForType(normalizedType);
   const receivable = Number(data.receivable || 0);
   const payable = Number(data.payable || 0);
   const received = 0;
@@ -1884,8 +2029,13 @@ function createOrderFromData(data, userId, meta = {}) {
     type: normalizedType,
     batchId: meta.batchId || "",
     customerId: data.customerId,
-    frontendId: userId,
-    backendId: "u-back",
+    frontendId: ownerId,
+    createdBy: userId,
+    orderSource: creator?.role === "backend" ? "后端创建" : creator?.role === "admin" ? "管理员创建" : "前端创建",
+    backendId: assignedBackendId,
+    assignmentMode: data.backendId ? "管理员指定" : "系统自动分配",
+    assignedAt: nowIso(),
+    assignedBy: userId,
     acceptedAt: today(),
     submittedAt: nowIso(),
     completedAt: "",
@@ -1914,7 +2064,7 @@ function createOrderFromData(data, userId, meta = {}) {
     payable,
     paid,
     performance: received - paid,
-    status: "待处理",
+    status: "待后端排单",
     paymentStatus: "未收款",
     payoutStatus: "未付款",
     workflow: normalizeOrderWorkflow({ paymentStatus: "未收款", payoutStatus: "未付款" }).workflow,
@@ -2069,12 +2219,23 @@ async function copyText(text) {
 }
 
 function renderImport() {
+  if (!canCreateOrders()) {
+    return `
+      <section class="section">
+        <div class="section-head"><h2>订单导入</h2><span class="hint">财务角色只审核收付款，不创建业务订单</span></div>
+        <div class="empty">当前账号无订单创建权限，请到财务管理处理收款和付款审核。</div>
+      </section>
+    `;
+  }
+  const user = currentUser();
   return `
     <section class="section">
-      <div class="section-head"><h2>手工录入订单</h2><span class="hint">订单按类型自动归入订单汇总</span></div>
+      <div class="section-head"><h2>手工录入订单</h2><span class="hint">所有订单创建后都会按业务类型进入对应后端排单池</span></div>
       <form id="manualOrderForm" class="form-grid">
         <div class="field"><label>业务类型</label><select name="type">${orderTypeLabels.map((type) => `<option>${type}</option>`).join("")}</select></div>
         <div class="field"><label>客户</label><select name="customerId" required>${visibleCustomers().map((c) => `<option value="${c.id}">${c.name}</option>`).join("")}</select></div>
+        ${user.role === "admin" ? `<div class="field"><label>接单归属</label><select name="frontendId">${users.filter((u) => ["frontend", "backend", "admin"].includes(u.role)).map((u) => `<option value="${u.id}">${u.name}</option>`).join("")}</select></div>` : ""}
+        ${user.role === "admin" ? `<div class="field"><label>后端负责人</label><select name="backendId"><option value="">按业务类型自动分配</option>${users.filter((u) => u.role === "backend").map((u) => `<option value="${u.id}">${u.name}（${backendScopeText(u)}）</option>`).join("")}</select></div>` : ""}
         <div class="field"><label>站点</label><select name="site">${vpSites.map((site) => `<option>${site}</option>`).join("")}</select></div>
         <div class="field"><label>数量</label><input name="quantity" type="number" min="1" value="1" /></div>
         <div class="field"><label>项目</label><select name="project">${["5星", "4星", "3星", "2星", "1星", ...vpProjects, "VINE定制", "买家秀"].map((p) => `<option>${p}</option>`).join("")}</select></div>
@@ -2207,7 +2368,9 @@ function renderGenericImportPreview() {
 }
 
 function bindImport() {
-  document.querySelector("#manualOrderForm").addEventListener("submit", (event) => {
+  const manualForm = document.querySelector("#manualOrderForm");
+  if (!manualForm) return;
+  manualForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget).entries());
     const order = createOrderFromData(data, currentUser().id);
@@ -2719,7 +2882,7 @@ function ensureImportCustomer(row) {
     phone: "",
     store: "",
     site: row.site || "",
-    ownerId: user.role === "frontend" ? user.id : "u-fe-a",
+    ownerId: user.id,
     team: user.team || "一组",
     status: "待补联系方式",
     contactConfirmed: false,
@@ -2781,9 +2944,9 @@ function renderFinance() {
 }
 
 function renderBackendWorkspace() {
-  const orders = visibleOrders().filter((o) => !o.voided);
-  const waiting = orders.filter((o) => o.status === "待处理").length;
-  const handling = orders.filter((o) => !isFinanciallyComplete(o) && o.status !== "待处理").length;
+  const orders = state.orders.filter((o) => !o.voided && o.backendId === currentUser().id);
+  const waiting = orders.filter((o) => ["待处理", "待后端排单"].includes(o.status)).length;
+  const handling = orders.filter((o) => !isFinanciallyComplete(o) && !["待处理", "待后端排单"].includes(o.status)).length;
   const needCollectionProof = orders.filter((o) => o.paymentStatus !== "已收款" && !o.workflow?.customerPaymentProof).length;
   const needPayoutRequest = orders.filter((o) => o.payoutStatus !== "已付款" && o.workflow?.payoutRequestStatus !== "待财务审核").length;
   const rejected = orders.filter((o) => o.workflow?.payoutRequestStatus === "财务已退回" || o.paymentStatus === "收款退回").length;
@@ -3174,6 +3337,71 @@ function readFileAsDataUrl(file) {
     reader.readAsDataURL(file);
   });
 }
+
+function renderAccounts() {
+  if (currentUser().role !== "admin") {
+    return `<section class="section"><div class="empty">仅管理员可管理账号角色。</div></section>`;
+  }
+  return `
+    <section class="section">
+      <div class="section-head"><h2>账号角色管理</h2><span class="hint">当前为静态 MVP 配置视图，正式版接数据库后支持新增、停用和权限保存</span></div>
+      <div class="grid cols-3">
+        <div class="metric"><span>账号总数</span><strong>${users.length}</strong></div>
+        <div class="metric"><span>参与销售激励</span><strong>${users.filter((user) => user.role === "frontend" && user.incentive).length}</strong></div>
+        <div class="metric"><span>后端分工</span><strong>2组</strong></div>
+      </div>
+      <div class="table-wrap mt-12">
+        <table>
+          <thead><tr><th>头像</th><th>姓名</th><th>角色</th><th>小组</th><th>负责业务</th><th>销售激励</th><th>创建订单</th><th>备注</th></tr></thead>
+          <tbody>
+            ${users
+              .map(
+                (user) => `
+                  <tr>
+                    <td>${renderAvatar(user)}</td>
+                    <td>${user.name}</td>
+                    <td>${roleNames[user.role]}</td>
+                    <td>${user.team}</td>
+                    <td>${backendScopeText(user)}</td>
+                    <td>${user.role === "frontend" && user.incentive ? `<span class="tag green">参与</span>` : `<span class="tag gray">不参与</span>`}</td>
+                    <td>${canCreateOrders(user) ? `<span class="tag green">可创建</span>` : `<span class="tag gray">不可创建</span>`}</td>
+                    <td>${accountRuleText(user)}</td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section">
+      <div class="section-head"><h2>业务自动分配规则</h2><span class="hint">所有角色创建的订单都进入后端排单池</span></div>
+      <div class="table-wrap">
+        <table class="compact-table">
+          <thead><tr><th>业务类型</th><th>默认后端负责人</th><th>日常规则</th><th>管理员权限</th></tr></thead>
+          <tbody>
+            ${orderTypes
+              .map((type) => {
+                const backend = users.find((user) => user.id === defaultBackendIdForType(type.label));
+                return `<tr><td>${type.label}</td><td>${backend?.name || "-"}</td><td>创建后自动进入该后端待排单池</td><td>管理员可手动改派或代排单</td></tr>`;
+              })
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function accountRuleText(user) {
+  if (user.role === "frontend") return "接客户订单，参与销售榜";
+  if (user.role === "backend") return `负责${backendScopeText(user)}排单执行`;
+  if (user.role === "finance") return "审核收款、付款和流水";
+  if (user.role === "admin") return "全局管理，可创建和分配订单";
+  return "可查看本组数据";
+}
+
+function bindAccounts() {}
 
 function renderPricing() {
   const isAdmin = currentUser().role === "admin";

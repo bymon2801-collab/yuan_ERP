@@ -68,6 +68,34 @@ button {
   line-height: 1.8;
 }
 
+.login-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 28px;
+  max-width: 640px;
+}
+
+.login-role-card {
+  border: 1px solid rgba(180, 194, 214, 0.72);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.68);
+  padding: 14px;
+  box-shadow: var(--soft-shadow);
+}
+
+.login-role-card strong {
+  display: block;
+  color: #0f172a;
+  margin-bottom: 6px;
+}
+
+.login-role-card span {
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 13px;
+}
+
 .login-panel {
   display: flex;
   align-items: center;
@@ -449,6 +477,86 @@ button {
   display: block;
   margin-top: 8px;
   font-size: 24px;
+}
+
+.rank-card-grid,
+.champion-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.rank-card,
+.champion-card {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #dbe5f0;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #fff 0%, #f8fbff 100%);
+  padding: 14px;
+}
+
+.rank-card {
+  grid-template-columns: 34px 48px minmax(0, 1fr) auto auto;
+}
+
+.champion-card {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
+.rank-number {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: var(--brand-dark);
+  font-weight: 800;
+}
+
+.rank-card.rank-1 .rank-number {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.avatar {
+  width: 44px;
+  height: 44px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1e3a8a;
+  font-weight: 800;
+  border: 1px solid #bfdbfe;
+}
+
+.rank-body {
+  min-width: 0;
+}
+
+.rank-body strong,
+.champion-card strong {
+  display: block;
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.rank-body span,
+.champion-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.rank-amount {
+  font-size: 18px;
+  font-weight: 800;
+  color: #0f172a;
+  white-space: nowrap;
 }
 
 .admin-dashboard {
@@ -1055,6 +1163,10 @@ tbody tr:hover td {
     grid-template-columns: 1fr;
   }
 
+  .login-role-grid {
+    grid-template-columns: 1fr;
+  }
+
   .sidebar {
     position: static;
   }
@@ -1066,8 +1178,18 @@ tbody tr:hover td {
   .grid.cols-2,
   .grid.cols-3,
   .form-grid,
-  .import-grid {
+  .import-grid,
+  .rank-card-grid,
+  .champion-grid {
     grid-template-columns: 1fr;
+  }
+
+  .rank-card {
+    grid-template-columns: 30px 44px minmax(0, 1fr);
+  }
+
+  .rank-amount {
+    grid-column: 3;
   }
 
   .admin-dashboard-top {
