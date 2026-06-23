@@ -228,7 +228,7 @@ button {
 .app-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 256px 1fr;
+  grid-template-columns: 256px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -310,6 +310,7 @@ button {
 }
 
 .content {
+  min-width: 0;
   padding: 24px;
   display: grid;
   gap: 20px;
@@ -317,6 +318,7 @@ button {
 }
 
 .section {
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -650,6 +652,24 @@ button {
 
 .toolbar-right {
   margin-left: auto;
+}
+
+.message-button {
+  position: relative;
+}
+
+.message-badge {
+  min-width: 20px;
+  height: 20px;
+  display: inline-grid;
+  place-items: center;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
 }
 
 .toolbar input,
@@ -1157,6 +1177,86 @@ tbody tr:hover td {
   max-width: none;
 }
 
+.collaboration-section {
+  border-top: 3px solid #2563eb;
+}
+
+.collaboration-table {
+  min-width: 1120px;
+}
+
+.collaboration-table .task-row td {
+  background: #f0f7ff;
+}
+
+.collaboration-table .task-row:hover td {
+  background: #e7f2ff;
+}
+
+.collaboration-table .unread-row td:first-child {
+  box-shadow: inset 4px 0 #2563eb;
+}
+
+.collaboration-table .unread-row td {
+  font-weight: 500;
+}
+
+.payout-batch-table {
+  min-width: 1040px;
+}
+
+.upload-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.upload-button input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.collaboration-timeline {
+  display: grid;
+  gap: 8px;
+}
+
+.collaboration-event {
+  display: grid;
+  grid-template-columns: 120px 110px minmax(0, 1fr) 150px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid #e3eaf3;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.collaboration-event span,
+.collaboration-event em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.collaboration-event strong {
+  font-size: 13px;
+}
+
+.collaboration-event p {
+  margin: 0;
+  line-height: 1.55;
+}
+
 @media (max-width: 980px) {
   .login-shell,
   .app-shell {
@@ -1205,7 +1305,8 @@ tbody tr:hover td {
   }
 
   .detail-grid,
-  .timeline-list div {
+  .timeline-list div,
+  .collaboration-event {
     grid-template-columns: 1fr;
   }
 
